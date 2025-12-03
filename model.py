@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import contextlib
 import random
 import copy
@@ -20,6 +20,15 @@ from torch_frame.utils.infer_stype import infer_series_stype
 from torch_frame import stype
 from utils import question_dict, description_dict, initialize_weights
 
+# RT integration
+try:
+    from rt_adapter import RTEncoderOnly, HeteroDataToRTBatch, aggregate_cells_to_nodes
+    RT_AVAILABLE = True
+except ImportError as e:
+    RT_AVAILABLE = False
+    print(f"Warning: RT adapter not available. RT integration disabled.")
+    print(f"Import error: {e}")
+
 # llama model type: https://huggingface.co/meta-llama
 # encode special tokens for Llama 3.2: https://www.llama.com/docs/model-cards-and-prompt-formats/meta-llama-3/
 BOS = '<|begin_of_text|>'
@@ -34,12 +43,69 @@ class Model(torch.nn.Module):
     def __init__(self, data: HeteroData, col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]], num_layers: int, channels: int, out_channels: int, aggr: str,
                  norm: str = "batch_norm", dropout=0.0, shallow_list: List[NodeType] = [],  # List of node types to add shallow embeddings to input
                  id_awareness: bool = False, model_type: str = "meta-llama/Llama-3.2-1B", max_new_tokens=1, llm_frozen=False, output_mlp=False, output_probs=True, num_demo=4,
-                 dataset=None, task=None, gamma=2.0, alpha=[1.0, 1.0], mask_ratio=0.5, pretrain_random_table=False, pretrain_mask_cell=True):
+                 dataset=None, task=None, gamma=2.0, alpha=[1.0, 1.0], mask_ratio=0.5, pretrain_random_table=False, pretrain_mask_cell=True,
+                 use_rt_encoder: bool = False, rt_config: Optional[Dict] = None, text_embedder=None):
         super().__init__()
+        self.aggr = aggr  # Store aggregation method for RT cell-to-node aggregation
+        self.use_rt_encoder = use_rt_encoder and RT_AVAILABLE
+        
+        if self.use_rt_encoder:
+            # RT encoder path
+            if rt_config is None:
+                rt_config = {}
+            
+            # Import RT model
+            import sys
+            from pathlib import Path
+            rt_path = Path(__file__).parent / "relational-transformer"
+            if rt_path.exists():
+                sys.path.insert(0, str(rt_path))
+                from rt.model import RelationalTransformer
+                
+                # Initialize RT model
+                self.rt_model = RelationalTransformer(
+                    num_blocks=rt_config.get('num_blocks', 4),
+                    d_model=rt_config.get('d_model', 512),
+                    d_text=rt_config.get('d_text', 384),
+                    num_heads=rt_config.get('num_heads', 8),
+                    d_ff=rt_config.get('d_ff', 2048),
+                )
+                
+                # Wrap for encoder-only output
+                self.rt_encoder = RTEncoderOnly(self.rt_model)
+                
+                # Adapter for data conversion
+                self.rt_adapter = HeteroDataToRTBatch(
+                    col_stats_dict=col_stats_dict,
+                    text_embedder=text_embedder,
+                    d_text=rt_config.get('d_text', 384)
+                )
+                
+                # Projection from RT d_model to Rel-LLM channels
+                rt_d_model = rt_config.get('d_model', 512)
+                self.rt_to_channels = Linear(rt_d_model, channels)
+                
+                # Load pretrained weights if available
+                if rt_config.get('pretrained_path'):
+                    try:
+                        state_dict = torch.load(rt_config['pretrained_path'], map_location='cpu')
+                        self.rt_model.load_state_dict(state_dict, strict=False)
+                        print(f"Loaded RT pretrained weights from {rt_config['pretrained_path']}")
+                    except Exception as e:
+                        print(f"Warning: Could not load RT pretrained weights: {e}")
+                
+                print(f"Using RT encoder: d_model={rt_d_model}, num_blocks={rt_config.get('num_blocks', 4)}")
+            else:
+                print("Warning: relational-transformer not found. Falling back to GNN.")
+                self.use_rt_encoder = False
+        
+        if not self.use_rt_encoder:
+            # Original HeteroEncoder + GNN path
         self.encoder = HeteroEncoder(channels=channels, node_to_col_names_dict={node_type: data[node_type].tf.col_names_dict for node_type in data.node_types},
                                      node_to_col_stats=col_stats_dict, )
+            self.gnn = HeteroGraphSAGE(node_types=data.node_types, edge_types=data.edge_types, channels=channels, aggr=aggr, num_layers=num_layers)
+        
         self.temporal_encoder = HeteroTemporalEncoder(node_types=[node_type for node_type in data.node_types if "time" in data[node_type]], channels=channels, )
-        self.gnn = HeteroGraphSAGE(node_types=data.node_types, edge_types=data.edge_types, channels=channels, aggr=aggr, num_layers=num_layers)
         self.head = MLP(channels, out_channels=out_channels, norm=norm, num_layers=1, dropout=dropout)
         self.embedding_dict = ModuleDict({node: Embedding(data.num_nodes_dict[node], channels) for node in shallow_list})
         self.id_awareness_emb = Embedding(1, channels) if id_awareness else None
@@ -102,9 +168,16 @@ class Model(torch.nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        if not self.use_rt_encoder:
         self.encoder.reset_parameters()
+            self.gnn.reset_parameters()
+        else:
+            # RT model parameters are initialized in RelationalTransformer.__init__
+            if hasattr(self, 'rt_to_channels'):
+                torch.nn.init.kaiming_uniform_(self.rt_to_channels.weight, nonlinearity='linear')
+                if self.rt_to_channels.bias is not None:
+                    torch.nn.init.zeros_(self.rt_to_channels.bias)
         self.temporal_encoder.reset_parameters()
-        self.gnn.reset_parameters()
         self.head.reset_parameters()
         for embedding in self.embedding_dict.values():
             torch.nn.init.normal_(embedding.weight, std=0.1)
@@ -145,6 +218,27 @@ class Model(torch.nn.Module):
     def encode(self, batch, entity_table):
         seed_time = batch[entity_table].seed_time  # seed time indicates at which time the target is to be predicted, filtering future data.
         batch_size = len(seed_time)
+        
+        if self.use_rt_encoder:
+            # RT encoder path
+            # Convert HeteroData → RT batch format
+            rt_batch = self.rt_adapter.convert(batch, entity_table, batch_size)
+            
+            # RT forward (encoder only)
+            cell_embeds = self.rt_encoder(rt_batch)  # (B, S, d_model)
+            
+            # Aggregate cells → nodes (using same aggregation as Rel-LLM GNN)
+            x_dict = aggregate_cells_to_nodes(
+                cell_embeds, rt_batch, batch, entity_table, aggr=self.aggr
+            )
+            
+            # Project to channels dimension
+            x_dict = {
+                node_type: self.rt_to_channels(emb)
+                for node_type, emb in x_dict.items()
+            }
+        else:
+            # Original HeteroEncoder path
         x_dict = self.encoder(batch.tf_dict)  # encode interactions within each table (tensor_frame)
 
         # batch_dict -> index of each node in seed time (different from batch.batch!)
@@ -183,6 +277,7 @@ class Model(torch.nn.Module):
                 select_table = random.choice([i for i in x_dict.keys() if x_dict[i].numel() > 0])  # random select a node type
             x_dict[select_table][mask_indices] = self.mask_embed.weight   # mask token embeddings
 
+        if not self.use_rt_encoder:
         x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
         node_embed = x_dict[select_table][:batch_size]
         node_embed = self.projector(node_embed)
@@ -263,6 +358,7 @@ class Model(torch.nn.Module):
     def get_demo_info(self, demo_batch, entity_table):
         x_dict, demo_batch_size = self.encode(demo_batch, entity_table)
         assert self.num_demo <= demo_batch_size, 'Too large demo numbers!'
+        if not self.use_rt_encoder:
         x_dict = self.gnn(x_dict, demo_batch.edge_index_dict)
         demo_node_embeds = self.projector(x_dict[entity_table][:demo_batch_size])
         demo_labels = self.label_tokenize(demo_batch, entity_table).input_ids
@@ -334,7 +430,9 @@ class Model(torch.nn.Module):
 
         # num_sampled_nodes_dict ->  the number of sampled nodes for each node type at each layer (hop)
         """ {'user_friends': [0, 67636, 0], 'users': [512, 0, 2812], 'event_attendees': [0, 4751, 149], 'events': [0, 85, 4943], 'event_interest': [0, 224, 1]} """
+        if not self.use_rt_encoder:
         x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
+        # If using RT, skip GNN (RT already did relational processing via attention)
         node_embed = x_dict[entity_table][:batch_size]
         if self.model is None: return self.head(node_embed)  # output prediction
         node_embed = self.projector(node_embed)
@@ -506,6 +604,10 @@ class Model(torch.nn.Module):
         if self.id_awareness_emb is None:
             raise RuntimeError("id_awareness must be set True to use forward_dst_readout")
         seed_time = batch[entity_table].seed_time
+        if self.use_rt_encoder:
+            # Use encode method which handles RT
+            x_dict, _ = self.encode(batch, entity_table)
+        else:
         x_dict = self.encoder(batch.tf_dict)
         # Add ID-awareness to the root node
         x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
@@ -514,6 +616,7 @@ class Model(torch.nn.Module):
             x_dict[node_type] = x_dict[node_type] + rel_time
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+        if not self.use_rt_encoder:
         x_dict = self.gnn(x_dict, batch.edge_index_dict)
         return self.head(x_dict[dst_table])
 

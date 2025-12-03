@@ -68,6 +68,15 @@ if __name__ == '__main__':
     parser.add_argument("--text_embedder", type=str, default='glove', choices=['glove', 'mpnet'])
     parser.add_argument("--text_embedder_path", type=str, default="./cache")
 
+    # RT encoder
+    parser.add_argument("--use_rt_encoder", action='store_true', help="Use Relational Transformer encoder instead of GNN")
+    parser.add_argument("--rt_num_blocks", type=int, default=4, help="Number of RT transformer blocks")
+    parser.add_argument("--rt_d_model", type=int, default=512, help="RT model dimension")
+    parser.add_argument("--rt_d_text", type=int, default=384, help="RT text embedding dimension")
+    parser.add_argument("--rt_num_heads", type=int, default=8, help="Number of attention heads in RT")
+    parser.add_argument("--rt_d_ff", type=int, default=2048, help="RT feed-forward dimension")
+    parser.add_argument("--rt_pretrained_path", type=str, default=None, help="Path to RT pretrained checkpoint")
+
     # LLMs
     # huggingface-cli download --resume-download gpt2 --local-dir gpt2
     # huggingface-cli download --resume-download deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --local-dir /ai/design/RelGraph/DeepSeek-R1-Distill-Qwen-32B
@@ -147,9 +156,21 @@ if __name__ == '__main__':
     #############################################
     # model training
     #############################################
+    # RT config
+    rt_config = None
+    if args.use_rt_encoder:
+        rt_config = {
+            'num_blocks': args.rt_num_blocks,
+            'd_model': args.rt_d_model,
+            'd_text': args.rt_d_text,
+            'num_heads': args.rt_num_heads,
+            'd_ff': args.rt_d_ff,
+            'pretrained_path': args.rt_pretrained_path,
+        }
+    
     model = Model(data, col_stats_dict, args.num_layers, channels=args.channels, out_channels=out_channels, aggr=args.aggr, dropout=args.dropout, model_type=args.model_type,
                   llm_frozen=args.llm_frozen, output_mlp=args.output_mlp, max_new_tokens=args.max_new_tokens, alpha=args.loss_class_weight, num_demo=args.num_demo,
-                  dataset=args.dataset, task=task).to(device)
+                  dataset=args.dataset, task=task, use_rt_encoder=args.use_rt_encoder, rt_config=rt_config, text_embedder=text_embedder).to(device)
     params = [p for _, p in model.named_parameters() if p.requires_grad]
     if args.wd != 0:  # weight decay should not be applied to bias terms and LayerNorm parameters
         optimizer = torch.optim.AdamW([{'params': [p for n, p in model.named_parameters() if "bias" not in n and "LayerNorm" not in n], 'weight_decay': args.wd},
@@ -222,7 +243,7 @@ if __name__ == '__main__':
     if not args.debug:
         if args.pretrain:
             run.finish()
-        run = wandb.init(project='rel-LLM', name=f'{args.dataset}_{args.task}', id=f"finetune_run_{args.dataset}_{args.task}", resume="allow")
+        run = wandb.init(entity="9race-stanford", project='rel-LLM', name=f'{args.dataset}_{args.task}', id=f"finetune_run_{args.dataset}_{args.task}", resume="allow")
     if state_dict is not None: model.load_state_dict(state_dict)  # load pretrained weights
     best_val_metric = -math.inf if higher_is_better else math.inf
     for epoch in range(1, args.epochs + 1):

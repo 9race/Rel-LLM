@@ -15,6 +15,7 @@ This repository supports our ACL 2025 paper:
 
 - 🔗 **Relational + Language Modeling**: Bridges multi-table relational structure with LLM reasoning capabilities.
 - 🧠 **GNN-Augmented Prompting**: Uses temporal-aware GraphSAGE and projection to format structured prompts.
+- 🚀 **RT Encoder Integration**: Optional Relational Transformer encoder for cell-level relational reasoning (NEW!)
 - 📊 **Full Benchmark Support**: Covers all 7 RelBench datasets and 30 diverse tasks.
 - 🧪 **Zero-shot & Finetuned**: Supports both inference-only and parameter-efficient finetuning regimes.
 - ⚙️ **GNN and LLM Interoperability**: Easy comparison with traditional GNN-only methods.
@@ -28,9 +29,11 @@ This repository supports our ACL 2025 paper:
 **Rel-LLM Workflow**:
 1. Construct a heterogeneous entity graph from relational tables.
 2. Sample temporal-aware subgraphs at each prediction time point.
-3. Encode graph structure using a GNN (e.g., GraphSAGE).
+3. Encode graph structure using a GNN (e.g., GraphSAGE) **or RT encoder** (optional).
 4. Project embeddings to LLM space and serialize as JSON prompts.
 5. Decode answers using frozen LLM with optional soft prompting.
+
+**RT Encoder Option**: Use `--use_rt_encoder` to replace GNN with Relational Transformer for cell-level relational reasoning.
 
 ---
 
@@ -68,8 +71,10 @@ Here, `Llama-3.1` is leveraged. Please log in to Huggingface for downloading the
 
 
 ## 🧪 Example Commands
-**rel-event** (classification):
 
+### Standard GNN Encoder (Default)
+
+**rel-event** (classification):
 ```bash
 python main.py --dataset=rel-event --task=user-ignore --epochs=3 --batch_size=2 \
   --lr=0.0001 --dropout=0.2 --llm_frozen 
@@ -82,8 +87,36 @@ python main.py --dataset=rel-amazon --task=user-ltv --epochs=10 --batch_size=1 \
   --max_new_tokens=3 --text_embedder=mpnet
 ```
 
+### RT Encoder (New!)
+
+**rel-amazon** (classification) with RT:
+```bash
+python main.py --dataset=rel-amazon --task=user-churn \
+  --use_rt_encoder \
+  --epochs=20 --batch_size=128 --lr=0.0001 --dropout=0.4 \
+  --llm_frozen --text_embedder=mpnet
+```
+
+**rel-amazon** (regression) with RT:
+```bash
+python main.py --dataset=rel-amazon --task=user-ltv \
+  --use_rt_encoder \
+  --epochs=20 --batch_size=128 --lr=0.0001 --dropout=0.4 \
+  --max_new_tokens=3 --text_embedder=mpnet --llm_frozen
+```
+
+**RT with pretrained weights**:
+```bash
+python main.py --dataset=rel-amazon --task=user-churn \
+  --use_rt_encoder \
+  --rt_pretrained_path ~/scratch/rt_ckpts/pretrain_rel-amazon_user-churn.pt \
+  --epochs=20 --batch_size=128 --lr=0.0001 --dropout=0.4 \
+  --llm_frozen
+```
+
 More example commands are available in `train_script.txt`.
 > Add `--debug` to disable Weights & Biases tracking.
+> See `RT_TRAINING_EXAMPLES.md` for detailed RT integration examples.
 
 
 

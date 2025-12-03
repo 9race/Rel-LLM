@@ -1,0 +1,5 @@
+Loading Database object from /dfs/user/graceluo/.cache/relbench/rel-amazon/db...
+Done in 73.61 seconds.
+Table names:  ['product', 'review', 'customer']
+Begin time:  2008-01-01 00:00:00 End time:  2016-01-01 00:00:00
+Val time:  2015-10-01 00:00:00 Test time:  2016-01-01 00:00:00
