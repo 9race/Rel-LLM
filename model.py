@@ -101,8 +101,8 @@ class Model(torch.nn.Module):
         
         if not self.use_rt_encoder:
             # Original HeteroEncoder + GNN path
-        self.encoder = HeteroEncoder(channels=channels, node_to_col_names_dict={node_type: data[node_type].tf.col_names_dict for node_type in data.node_types},
-                                     node_to_col_stats=col_stats_dict, )
+            self.encoder = HeteroEncoder(channels=channels, node_to_col_names_dict={node_type: data[node_type].tf.col_names_dict for node_type in data.node_types},
+                                         node_to_col_stats=col_stats_dict, )
             self.gnn = HeteroGraphSAGE(node_types=data.node_types, edge_types=data.edge_types, channels=channels, aggr=aggr, num_layers=num_layers)
         
         self.temporal_encoder = HeteroTemporalEncoder(node_types=[node_type for node_type in data.node_types if "time" in data[node_type]], channels=channels, )
@@ -169,7 +169,7 @@ class Model(torch.nn.Module):
 
     def reset_parameters(self):
         if not self.use_rt_encoder:
-        self.encoder.reset_parameters()
+            self.encoder.reset_parameters()
             self.gnn.reset_parameters()
         else:
             # RT model parameters are initialized in RelationalTransformer.__init__
@@ -239,7 +239,7 @@ class Model(torch.nn.Module):
             }
         else:
             # Original HeteroEncoder path
-        x_dict = self.encoder(batch.tf_dict)  # encode interactions within each table (tensor_frame)
+            x_dict = self.encoder(batch.tf_dict)  # encode interactions within each table (tensor_frame)
 
         # batch_dict -> index of each node in seed time (different from batch.batch!)
         rel_time_dict = self.temporal_encoder(seed_time, batch.time_dict, batch.batch_dict)  # add time embedding to time-dependent node features
@@ -278,7 +278,7 @@ class Model(torch.nn.Module):
             x_dict[select_table][mask_indices] = self.mask_embed.weight   # mask token embeddings
 
         if not self.use_rt_encoder:
-        x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
+            x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
         node_embed = x_dict[select_table][:batch_size]
         node_embed = self.projector(node_embed)
 
@@ -359,7 +359,7 @@ class Model(torch.nn.Module):
         x_dict, demo_batch_size = self.encode(demo_batch, entity_table)
         assert self.num_demo <= demo_batch_size, 'Too large demo numbers!'
         if not self.use_rt_encoder:
-        x_dict = self.gnn(x_dict, demo_batch.edge_index_dict)
+            x_dict = self.gnn(x_dict, demo_batch.edge_index_dict)
         demo_node_embeds = self.projector(x_dict[entity_table][:demo_batch_size])
         demo_labels = self.label_tokenize(demo_batch, entity_table).input_ids
         demo_labels = torch.tensor(demo_labels, device=self.device)
@@ -431,7 +431,7 @@ class Model(torch.nn.Module):
         # num_sampled_nodes_dict ->  the number of sampled nodes for each node type at each layer (hop)
         """ {'user_friends': [0, 67636, 0], 'users': [512, 0, 2812], 'event_attendees': [0, 4751, 149], 'events': [0, 85, 4943], 'event_interest': [0, 224, 1]} """
         if not self.use_rt_encoder:
-        x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
+            x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
         # If using RT, skip GNN (RT already did relational processing via attention)
         node_embed = x_dict[entity_table][:batch_size]
         if self.model is None: return self.head(node_embed)  # output prediction
@@ -608,7 +608,7 @@ class Model(torch.nn.Module):
             # Use encode method which handles RT
             x_dict, _ = self.encode(batch, entity_table)
         else:
-        x_dict = self.encoder(batch.tf_dict)
+            x_dict = self.encoder(batch.tf_dict)
         # Add ID-awareness to the root node
         x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
         rel_time_dict = self.temporal_encoder(seed_time, batch.time_dict, batch.batch_dict)
@@ -617,7 +617,7 @@ class Model(torch.nn.Module):
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
         if not self.use_rt_encoder:
-        x_dict = self.gnn(x_dict, batch.edge_index_dict)
+            x_dict = self.gnn(x_dict, batch.edge_index_dict)
         return self.head(x_dict[dst_table])
 
     def print_trainable_params(self):
