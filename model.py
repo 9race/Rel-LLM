@@ -85,6 +85,11 @@ class Model(torch.nn.Module):
                 rt_d_model = rt_config.get('d_model', 512)
                 self.rt_to_channels = Linear(rt_d_model, channels)
                 
+                # Maximum sequence length for RT encoder (to prevent OOM)
+                # RT uses seq_len=1024, but we allow configurable limit
+                # Memory scales as O(S²) for attention masks, so limit conservatively
+                self.rt_max_seq_len = rt_config.get('max_seq_len', 2048)
+                
                 # Load pretrained weights if available
                 if rt_config.get('pretrained_path'):
                     try:
@@ -94,7 +99,7 @@ class Model(torch.nn.Module):
                     except Exception as e:
                         print(f"Warning: Could not load RT pretrained weights: {e}")
                 
-                print(f"Using RT encoder: d_model={rt_d_model}, num_blocks={rt_config.get('num_blocks', 4)}")
+                print(f"Using RT encoder: d_model={rt_d_model}, num_blocks={rt_config.get('num_blocks', 4)}, max_seq_len={self.rt_max_seq_len}")
             else:
                 print("Warning: relational-transformer not found. Falling back to GNN.")
                 self.use_rt_encoder = False
@@ -102,7 +107,7 @@ class Model(torch.nn.Module):
         if not self.use_rt_encoder:
             # Original HeteroEncoder + GNN path
             self.encoder = HeteroEncoder(channels=channels, node_to_col_names_dict={node_type: data[node_type].tf.col_names_dict for node_type in data.node_types},
-                                         node_to_col_stats=col_stats_dict, )
+                                     node_to_col_stats=col_stats_dict, )
             self.gnn = HeteroGraphSAGE(node_types=data.node_types, edge_types=data.edge_types, channels=channels, aggr=aggr, num_layers=num_layers)
         
         self.temporal_encoder = HeteroTemporalEncoder(node_types=[node_type for node_type in data.node_types if "time" in data[node_type]], channels=channels, )
@@ -153,6 +158,13 @@ class Model(torch.nn.Module):
                 model = get_peft_model(model, config)
 
             self.model = model
+            # Make LLaMA cheaper / more memory-friendly
+            self.model.config.use_cache = False          # no KV cache during training
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            # Use bf16 on GPU if available (saves memory vs fp16/fp32)
+            if torch.cuda.is_available():
+                self.model.to(dtype=torch.bfloat16)
             self.word_embedding = self.model.model.get_input_embeddings()
             if model_type == "Qwen/Qwen2.5-7B-Instruct":
                 out_dim = 3584
@@ -223,6 +235,20 @@ class Model(torch.nn.Module):
             # RT encoder path
             # Convert HeteroData → RT batch format
             rt_batch = self.rt_adapter.convert(batch, entity_table, batch_size)
+            
+            # Truncate sequence if too long to prevent OOM
+            # Memory scales as O(S²) for attention masks, so limit sequence length
+            seq_len = rt_batch['node_idxs'].shape[1]
+            if seq_len > self.rt_max_seq_len:
+                print(f"Warning: Truncating RT sequence from {seq_len} to {self.rt_max_seq_len} to prevent OOM")
+                # Truncate all batch tensors consistently
+                for k, v in rt_batch.items():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                        if v.shape[1] == seq_len:  # Sequence dimension
+                            rt_batch[k] = v[:, :self.rt_max_seq_len]
+                        elif v.shape[1] > seq_len:  # Multi-dimensional (e.g., f2p_nbr_idxs)
+                            # For 3D tensors like f2p_nbr_idxs: (B, S, 5)
+                            rt_batch[k] = v[:, :self.rt_max_seq_len, :]
             
             # RT forward (encoder only)
             cell_embeds = self.rt_encoder(rt_batch)  # (B, S, d_model)
@@ -341,6 +367,19 @@ class Model(torch.nn.Module):
         attention_mask = torch.tensor(batch_attention_mask).to(self.device)
         label_input_ids = torch.tensor(batch_label_input_ids).to(self.device)
 
+        inputs_embeds = inputs_embeds.to(
+            device=self.model.device, dtype=self.model.dtype
+        )
+        attention_mask = attention_mask.to(device=self.model.device)
+        label_input_ids = label_input_ids.to(device=self.model.device)
+
+        MAX_CTX = 2048
+        seq_len = inputs_embeds.size(1)
+        if seq_len > MAX_CTX:
+            inputs_embeds = inputs_embeds[:, -MAX_CTX:, :]
+            attention_mask = attention_mask[:, -MAX_CTX:]
+            label_input_ids = label_input_ids[:, -MAX_CTX:]
+            
         with self.maybe_autocast():
             outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True, labels=label_input_ids)
         return outputs.loss
@@ -425,169 +464,315 @@ class Model(torch.nn.Module):
                 all_embeddings.append(recursive_collect(target_type, target_id, neighbors))
         return torch.cat(all_embeddings) if all_embeddings else None
 
-    def forward(self, batch: HeteroData, entity_table: NodeType, context=True, demo_info=None, inference: bool = False) -> Tensor:
+    def forward(
+        self,
+        batch: HeteroData,
+        entity_table: NodeType,
+        context: bool = True,
+        demo_info=None,
+        inference: bool = False,
+    ) -> Tensor:
+        # 1) Encode graph → node embeddings
         x_dict, batch_size = self.encode(batch, entity_table)
 
         # num_sampled_nodes_dict ->  the number of sampled nodes for each node type at each layer (hop)
-        """ {'user_friends': [0, 67636, 0], 'users': [512, 0, 2812], 'event_attendees': [0, 4751, 149], 'events': [0, 85, 4943], 'event_interest': [0, 224, 1]} """
+        # e.g. {'user_friends': [0, 67636, 0], 'users': [512, 0, 2812], ...}
         if not self.use_rt_encoder:
             x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
-        # If using RT, skip GNN (RT already did relational processing via attention)
+
         node_embed = x_dict[entity_table][:batch_size]
-        if self.model is None: return self.head(node_embed)  # output prediction
+        if self.model is None:
+            # Pure GNN mode
+            return self.head(node_embed)
+
+        # Project graph embeddings to LLM dimension
         node_embed = self.projector(node_embed)
 
-        # encode description, questions and labels   # TODO: pad at last/in the middle? pad id to like 0006086 of the same length?
+        # 2) Text side: task description, question, labels
         task_desc = description_dict[self.dataset][self.task.name]
-        question = ' Question: ' + question_dict[self.dataset][self.task.name] + ' Answer: '  # https://huggingface.co/docs/transformers/tasks/prompting
+        question = " Question: " + question_dict[self.dataset][self.task.name] + " Answer: "
         task_descs = self.tokenizer(task_desc, add_special_tokens=False)
         questions = self.tokenizer(question, add_special_tokens=False)
-        if not inference and not self.output_mlp: labels = self.label_tokenize(batch, entity_table)
-        if context: neighbors = self.recursive_sample(batch, entity_table, torch.arange(batch_size), num_hops=1)
+
+        if not inference and not self.output_mlp:
+            labels = self.label_tokenize(batch, entity_table)
+
+        if context:
+            neighbors = self.recursive_sample(
+                batch, entity_table, torch.arange(batch_size), num_hops=1
+            )
+
+        # 3) In-context demos
         if self.num_demo > 0 and demo_info is not None:
-            # construct in-context demos
             demo_node_embeds, demo_labels = demo_info
-            if self.task.task_type == TaskType.BINARY_CLASSIFICATION:  # balanced sampling
+            if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
+                # Balanced sampling
                 mask = demo_labels == demo_labels[0].item()
-                indices_A = torch.where(mask)[0]  # Indices for class 0
-                indices_B = torch.where(~mask)[0]  # Indices for class 1
+                indices_A = torch.where(mask)[0]
+                indices_B = torch.where(~mask)[0]
                 count_A = indices_A.size(0)
                 count_B = indices_B.size(0)
                 num_demo_half = self.num_demo // 2
                 extra = self.num_demo % 2
-                assert count_A >= num_demo_half + extra and count_B >= num_demo_half + extra, "Not enough samples in one class"
-                sampled_A = indices_A[torch.randint(0, count_A, (batch_size, num_demo_half), device=self.device)]  # (B, K_half)
-                sampled_B = indices_B[torch.randint(0, count_B, (batch_size, num_demo_half), device=self.device)]  # (B, K_half)
-                if extra:  # if M is odd, randomly choose which class to take the extra from for each B'
+                assert (
+                    count_A >= num_demo_half + extra
+                    and count_B >= num_demo_half + extra
+                ), "Not enough samples in one class"
+                sampled_A = indices_A[
+                    torch.randint(0, count_A, (batch_size, num_demo_half), device=self.device)
+                ]
+                sampled_B = indices_B[
+                    torch.randint(0, count_B, (batch_size, num_demo_half), device=self.device)
+                ]
+                if extra:
                     extra_class = torch.randint(0, 2, (batch_size,), device=self.device)
-                    extra_A = indices_A[torch.randint(0, count_A, (batch_size,), device=self.device)]  # (B,)
-                    extra_B = indices_B[torch.randint(0, count_B, (batch_size,), device=self.device)]  # (B,)
-                    extra_samples = torch.where(extra_class, extra_B, extra_A).unsqueeze(1)  # (B, 1)
-                    sampled_indices = torch.cat([sampled_A, sampled_B, extra_samples], dim=1)  # (B, K_half*2 + 1)
+                    extra_A = indices_A[
+                        torch.randint(0, count_A, (batch_size,), device=self.device)
+                    ]
+                    extra_B = indices_B[
+                        torch.randint(0, count_B, (batch_size,), device=self.device)
+                    ]
+                    extra_samples = torch.where(extra_class, extra_B, extra_A).unsqueeze(1)
+                    sampled_indices = torch.cat(
+                        [sampled_A, sampled_B, extra_samples], dim=1
+                    )
                 else:
-                    sampled_indices = torch.cat([sampled_A, sampled_B], dim=1)  # (B, K)
-                shuffle_idx = torch.rand(batch_size, self.num_demo, device=self.device).argsort(dim=1)  # shuffle the indices
+                    sampled_indices = torch.cat([sampled_A, sampled_B], dim=1)
+                shuffle_idx = torch.rand(
+                    batch_size, self.num_demo, device=self.device
+                ).argsort(dim=1)
                 sampled_indices = sampled_indices.gather(1, shuffle_idx)
             else:
-                random_matrix = torch.rand(batch_size, len(demo_node_embeds), device=self.device)  # (B, B')
-                sampled_indices = random_matrix.argsort(dim=1)[:, :self.num_demo]  # (B, K)
-            demo_node_embeds = demo_node_embeds[sampled_indices]  # (B, K, D)
-            demo_labels = demo_labels[sampled_indices]  # (B, K, 1)
+                random_matrix = torch.rand(
+                    batch_size, len(demo_node_embeds), device=self.device
+                )
+                sampled_indices = random_matrix.argsort(dim=1)[:, : self.num_demo]
 
-        # print(neighbors)
-        # tokenizer happens on CPU
+            demo_node_embeds = demo_node_embeds[sampled_indices]  # (B, K, D)
+            demo_labels = demo_labels[sampled_indices]            # (B, K, 1)
+
+        # 4) Build per-sample prompts in embedding space
         batch_inputs_embeds = []
         batch_attention_mask = []
         batch_label_input_ids = []
-        for i in range(batch_size):  # TODO: do not need iteration (simplified)
-            # Add bos & eos token
+
+        for i in range(batch_size):
             input_ids = task_descs.input_ids + questions.input_ids + self.eos_user_id_list
+
             if not inference and not self.output_mlp:
-                label_input_ids = labels.input_ids[i] + self.eos_id_list  # EOS ceases generation
+                label_input_ids = labels.input_ids[i] + self.eos_id_list
                 input_ids += label_input_ids
 
-            # prioritize the entity details (which vary) over the static question.
             inputs_embeds = self.word_embedding(torch.tensor(input_ids).to(self.device))
+
+            # In-context demos
             if self.num_demo > 0 and demo_info is not None:
                 demo_embeds = []
                 for k in range(self.num_demo):
-                    demo_embeds += [demo_node_embeds[i][k].unsqueeze(0), self.word_embedding(demo_labels[i][k])]
-                demo_embeds.append(node_embed[i].unsqueeze(0))  # append the seed entity at last
-                inputs_embeds = torch.cat([inputs_embeds[:-1], torch.cat(demo_embeds), inputs_embeds[-1:]])
+                    demo_embeds += [
+                        demo_node_embeds[i][k].unsqueeze(0),
+                        self.word_embedding(demo_labels[i][k]),
+                    ]
+                demo_embeds.append(node_embed[i].unsqueeze(0))
+                inputs_embeds = torch.cat(
+                    [inputs_embeds[:-1], torch.cat(demo_embeds), inputs_embeds[-1:]]
+                )
+
+            # Graph prompt: root + neighbors
             graph_prompt = node_embed[i].unsqueeze(0)
             if context:
-                neighbor_embed = self.get_neighbor_embedding(neighbors[entity_table][i], x_dict)
+                neighbor_embed = self.get_neighbor_embedding(
+                    neighbors[entity_table][i], x_dict
+                )
                 if neighbor_embed is not None:
                     neighbor_embed = self.projector(neighbor_embed)
-                    # print(neighbor_embed.shape)
                     graph_prompt = torch.cat([graph_prompt, neighbor_embed])
-            inputs_embeds = torch.cat([self.bos_embeds, graph_prompt, inputs_embeds], dim=0)  # node embed after BOS
+
+            # BOS + graph prompt + text
+            inputs_embeds = torch.cat(
+                [self.bos_embeds, graph_prompt, inputs_embeds], dim=0
+            )
 
             batch_inputs_embeds.append(inputs_embeds)
             batch_attention_mask.append([1] * inputs_embeds.shape[0])
-            if not inference and not self.output_mlp:
-                label_input_ids = [IGNORE_INDEX] * (inputs_embeds.shape[0] - len(label_input_ids)) + label_input_ids
-                batch_label_input_ids.append(label_input_ids)  # auto-regressive + teacher forcing, https://github.com/XiaoxinHe/G-Retriever/issues/17
 
-        # pad inputs_embeds
-        max_length = max([x.shape[0] for x in batch_inputs_embeds])
+            if not inference and not self.output_mlp:
+                # Label positions are only the tail; earlier tokens are IGNORE_INDEX
+                label_input_ids = [IGNORE_INDEX] * (
+                    inputs_embeds.shape[0] - len(label_input_ids)
+                ) + label_input_ids
+                batch_label_input_ids.append(label_input_ids)
+
+        # 5) Pad to same length (still on CPU)
+        max_length = max(x.shape[0] for x in batch_inputs_embeds)
         for i in range(batch_size):
             pad_length = max_length - batch_inputs_embeds[i].shape[0]
-            batch_inputs_embeds[i] = torch.cat([self.pad_embeds.repeat(pad_length, 1), batch_inputs_embeds[i]])
-            batch_attention_mask[i] = [0] * pad_length + batch_attention_mask[i]
+            if pad_length > 0:
+                batch_inputs_embeds[i] = torch.cat(
+                    [self.pad_embeds.repeat(pad_length, 1), batch_inputs_embeds[i]],
+                    dim=0,
+                )
+                batch_attention_mask[i] = [0] * pad_length + batch_attention_mask[i]
+                if not inference and not self.output_mlp:
+                    batch_label_input_ids[i] = (
+                        [IGNORE_INDEX] * pad_length + batch_label_input_ids[i]
+                    )
+
+        # Stack on CPU
+        inputs_embeds = torch.stack(batch_inputs_embeds, dim=0)
+        attention_mask = torch.tensor(batch_attention_mask)
+        if not inference and not self.output_mlp:
+            label_input_ids = torch.tensor(batch_label_input_ids)
+
+        # Move to LLaMA device / dtype
+        inputs_embeds = inputs_embeds.to(
+            device=self.model.device, dtype=self.model.dtype
+        )
+        attention_mask = attention_mask.to(device=self.model.device)
+        if not inference and not self.output_mlp:
+            label_input_ids = label_input_ids.to(device=self.model.device)
+
+        # 6) Truncate to MAX_CTX for safety
+        MAX_CTX = 2048
+        seq_len = inputs_embeds.size(1)
+        if seq_len > MAX_CTX:
+            inputs_embeds = inputs_embeds[:, -MAX_CTX:, :]
+            attention_mask = attention_mask[:, -MAX_CTX:]
             if not inference and not self.output_mlp:
-                batch_label_input_ids[i] = [IGNORE_INDEX] * pad_length + batch_label_input_ids[i]  # `inputs_embeds` contain `labels`
+                label_input_ids = label_input_ids[:, -MAX_CTX:]
 
-        inputs_embeds = torch.stack(batch_inputs_embeds, dim=0).to(self.device)
-        attention_mask = torch.tensor(batch_attention_mask).to(self.device)
-
+        # 7) Output-MLP mode (no generation, just hidden states → head)
         if self.output_mlp:
-            with self.maybe_autocast():  # no need to call `generate() since we want hidden_states instead of new tokens`
-                outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True, output_hidden_states=True)
-            hidden = outputs.hidden_states[-1][..., -1, :]  # last hidden states
+            with self.maybe_autocast():
+                outputs = self.model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    output_hidden_states=True,
+                )
+            hidden = outputs.hidden_states[-1][..., -1, :]
             pred = self.lm_head(hidden).view(-1)
             return pred
 
+        # 8) TRAINING BRANCH
         if not inference:
-            #########################
-            # Training
-            #########################
-            label_input_ids = torch.tensor(batch_label_input_ids).to(self.device)
-
+            # Non-binary: use HuggingFace CE loss directly
             if self.task.task_type != TaskType.BINARY_CLASSIFICATION:
                 with self.maybe_autocast():
-                    outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True, labels=label_input_ids)
+                    outputs = self.model(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                        labels=label_input_ids,
+                    )
                 return outputs.loss
-            else:  # prevent over-fitting due to binary class imbalance
-                with self.maybe_autocast():
-                    outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
-                # Shift so that tokens < n predict n, https://github.com/huggingface/transformers/issues/10480
-                # https://discuss.huggingface.co/t/where-to-look-for-a-loss-definition-for-a-pretrained-model/26073/2
-                logits = outputs.logits[..., :-1, :].contiguous()  # (B, L-1，C)
-                labels = label_input_ids[..., 1:].contiguous()  # (B, L-1)
-                valid_mask = (labels != IGNORE_INDEX)
-                labels = labels[valid_mask]  # (2 * B), including the binary class + EOS
-                logits = logits[valid_mask]
-                probs = torch.nn.functional.softmax(logits, dim=-1)
-                probs = probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-                focal_weight = (1 - probs).pow(self.gamma)
-                loss = -focal_weight * probs.log()  # focal loss
-                if self.alpha is not None:
-                    class_weights = torch.ones(self.model.vocab_size).to(self.device)
-                    class_weights[self.false_id] = self.alpha[0]
-                    class_weights[self.true_id] = self.alpha[1]  # class weights
-                    alpha_t = class_weights.gather(dim=0, index=labels)
-                    loss = alpha_t * loss
-                return loss.mean()
 
-        #########################
-        # Inference
-        #########################
+            # Binary: chunked focal loss to avoid OOM
+            B = inputs_embeds.size(0)
+            chunk_size = 16  # tune as needed
+            total_loss = None
+            total_tokens = 0
+
+            for start in range(0, B, chunk_size):
+                end = min(B, start + chunk_size)
+                ie = inputs_embeds[start:end]
+                am = attention_mask[start:end]
+                li = label_input_ids[start:end]
+
+                with self.maybe_autocast():
+                    outputs = self.model(
+                        inputs_embeds=ie,
+                        attention_mask=am,
+                        return_dict=True,
+                    )
+
+                # Shift so tokens < n predict token n
+                logits = outputs.logits[..., :-1, :]  # (b, L-1, C)
+                labels = li[..., 1:]                  # (b, L-1)
+
+                valid_mask = labels != IGNORE_INDEX
+                if not valid_mask.any():
+                    continue
+
+                labels_valid = labels[valid_mask]
+                logits_valid = logits[valid_mask]
+
+                probs = torch.nn.functional.softmax(logits_valid, dim=-1)
+                probs = probs.gather(
+                    dim=-1, index=labels_valid.unsqueeze(-1)
+                ).squeeze(-1)
+
+                focal_weight = (1 - probs).pow(self.gamma)
+                loss_chunk = -focal_weight * probs.log()
+
+                if self.alpha is not None:
+                    class_weights = torch.ones(
+                        self.model.vocab_size, device=self.model.device
+                    )
+                    class_weights[self.false_id] = self.alpha[0]
+                    class_weights[self.true_id] = self.alpha[1]
+                    alpha_t = class_weights.gather(dim=0, index=labels_valid)
+                    loss_chunk = alpha_t * loss_chunk
+
+                n_valid = labels_valid.numel()
+                loss_sum = loss_chunk.sum()
+
+                if total_loss is None:
+                    total_loss = loss_sum
+                else:
+                    total_loss = total_loss + loss_sum
+
+                total_tokens += n_valid
+
+            if total_tokens == 0:
+                # No valid labels; return a dummy grad-bearing zero
+                return torch.zeros([], device=self.model.device, requires_grad=True)
+
+            return total_loss / total_tokens
+
+        # 9) INFERENCE BRANCH (inference=True): generation + decoding
         with self.maybe_autocast():
-            outputs = self.model.generate(inputs_embeds=inputs_embeds, max_new_tokens=self.max_new_tokens, attention_mask=attention_mask, return_dict_in_generate=True,
-                                          output_scores=True, use_cache=True,  # https://discuss.huggingface.co/t/what-is-the-purpose-of-use-cache-in-decoder/958
-                                          pad_token_id=self.tokenizer.pad_token_id)  # suppress hf warning
+            outputs = self.model.generate(
+                inputs_embeds=inputs_embeds,
+                max_new_tokens=self.max_new_tokens,
+                attention_mask=attention_mask,
+                return_dict_in_generate=True,
+                output_scores=True,
+                use_cache=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
 
         if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
-            if self.output_probs:  # yes/no
-                pred = outputs.scores[0][..., [self.false_id, self.true_id]]  # https://huggingface.co/docs/transformers/en/internal/generation_utils
-                # print('before softmax:', pred)
-                pred = torch.softmax(pred, dim=-1)[..., 1]  # output probs instead of 0/1, https://github.com/huggingface/transformers/issues/14498
+            if self.output_probs:
+                # Use logits of generated token for Yes/No
+                scores = outputs.scores[0]
+                pred = scores[..., [self.false_id, self.true_id]]
+                pred = torch.softmax(pred, dim=-1)[..., 1]
                 pred = torch.nan_to_num(pred, nan=0.5)
             else:
-                seq = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
-                # print(seq)
-                pred = torch.tensor([0.0 if i == 'No' else 1.0 for i in seq])
+                seq = self.tokenizer.batch_decode(
+                    outputs.sequences, skip_special_tokens=True
+                )
+                pred = torch.tensor([0.0 if s == "No" else 1.0 for s in seq])
         elif self.task.task_type == TaskType.REGRESSION:
-            seq = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
-            pred = []
-            for i in seq:
+            seq = self.tokenizer.batch_decode(
+                outputs.sequences, skip_special_tokens=True
+            )
+            vals = []
+            for s in seq:
                 try:
-                    pred.append(float(i))
+                    vals.append(float(s))
                 except ValueError:
-                    pred.append(0.0)  # Skip invalid entries
-            # print('Sequence: ', seq, 'Scores: ', pred)
-            pred = torch.tensor(pred)
+                    vals.append(0.0)
+            pred = torch.tensor(vals)
+        else:
+            # Multiclass classification via decoded token(s) – you can adapt this.
+            seq = self.tokenizer.batch_decode(
+                outputs.sequences, skip_special_tokens=True
+            )
+            # Placeholder: map string → class index outside or customize here.
+            raise NotImplementedError("Multiclass decoding not implemented.")
+
         return pred
 
     @staticmethod

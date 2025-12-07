@@ -30,105 +30,217 @@ class RTEncoderOnly(Module):
     """
     Wrapper around RelationalTransformer that returns embeddings only
     (no decoder/prediction head).
+
+    This replicates the encoder portion of RT's forward() method:
+    - builds attention masks
+    - builds block masks via _make_block_mask (which wants seq_len multiple of 128)
+    - encodes cell values
+    - runs relational blocks
+    - applies final norm_out
     """
     def __init__(self, rt_model: RelationalTransformer):
         super().__init__()
         self.rt_model = rt_model
-        
+        # 1) Don’t store KV cache during training
+
+
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
         """
         Forward pass that returns cell embeddings only.
-        
-        Args:
-            batch: RT batch format dict with:
-                - node_idxs: (B, S)
-                - f2p_nbr_idxs: (B, S, 5)
-                - col_name_idxs: (B, S)
-                - table_name_idxs: (B, S)
-                - sem_types: (B, S)
-                - is_padding: (B, S)
-                - masks: (B, S)
-                - number_values, text_values, datetime_values, boolean_values, col_name_values
-            
+
+        batch keys (before padding):
+            node_idxs:       (B, S)
+            f2p_nbr_idxs:    (B, S, 5)
+            col_name_idxs:   (B, S)
+            table_name_idxs: (B, S)
+            sem_types:       (B, S)
+            is_padding:      (B, S)
+            masks:           (B, S)
+            number_values:   (B, S, 1)
+            text_values:     (B, S, d_text)
+            datetime_values: (B, S, 1)
+            boolean_values:  (B, S, 1)
+            col_name_values: (B, S, d_text)
+
         Returns:
-            cell_embeds: (B, S, d_model) cell embeddings
+            x: (B, S, d_model) encoder output (unpadded)
         """
         node_idxs = batch["node_idxs"]
         f2p_nbr_idxs = batch["f2p_nbr_idxs"]
         col_name_idxs = batch["col_name_idxs"]
         table_name_idxs = batch["table_name_idxs"]
         is_padding = batch["is_padding"]
+
         batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
-        
-        # Compute attention masks (same as RT)
+
+        # Handle empty sequences
+        if seq_len == 0:
+            d_model = self.rt_model.d_model
+            return torch.zeros(batch_size, 0, d_model, device=device)
+
+        # ---- PAD SEQUENCE TO MULTIPLE OF 128 FOR FLEX_ATTENTION ----
+        original_seq_len = seq_len
+        needs_padding = (seq_len > 0) and (seq_len % 128 != 0)
+
+        if needs_padding:
+            padded_seq_len = ((seq_len + 127) // 128) * 128
+            pad_size = padded_seq_len - seq_len
+
+            padded_is_padding = F.pad(is_padding, (0, pad_size), value=True)
+
+            padded_batch = {}
+            for k, v in batch.items():
+                if k == "is_padding":
+                    padded_batch[k] = padded_is_padding
+                elif k in ["node_idxs", "col_name_idxs", "table_name_idxs",
+                           "sem_types", "masks"]:
+                    # (B, S)
+                    if v.dim() == 2:
+                        padded_batch[k] = F.pad(v, (0, pad_size), value=0)
+                    else:
+                        padded_batch[k] = v
+                elif k == "f2p_nbr_idxs":
+                    # (B, S, 5)  pad S dimension
+                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=-1)
+                elif k in ["number_values", "datetime_values", "boolean_values"]:
+                    # (B, S, 1)
+                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=0.0)
+                elif k in ["text_values", "col_name_values"]:
+                    # (B, S, d_text)
+                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=0.0)
+                else:
+                    # any other tensors untouched
+                    padded_batch[k] = v
+
+            # Sanity checks: everything that depends on S should now be padded_seq_len
+            for k in ["number_values", "text_values", "datetime_values",
+                      "boolean_values", "col_name_values"]:
+                if k in padded_batch:
+                    v = padded_batch[k]
+                    if v.dim() >= 2:
+                        if v.shape[1] != padded_seq_len:
+                            raise RuntimeError(
+                                f"Padding mismatch for {k}: expected S={padded_seq_len}, "
+                                f"got {v.shape[1]}, shape={v.shape}"
+                            )
+
+            for k in ["is_padding", "sem_types", "masks", "node_idxs",
+                      "col_name_idxs", "table_name_idxs"]:
+                if k in padded_batch:
+                    v = padded_batch[k]
+                    if v.dim() >= 2 and v.shape[1] != padded_seq_len:
+                        raise RuntimeError(
+                            f"Padding mismatch for {k}: expected S={padded_seq_len}, "
+                            f"got {v.shape[1]}, shape={v.shape}"
+                        )
+
+            # Update references
+            batch = padded_batch
+            seq_len = padded_seq_len
+            is_padding = padded_is_padding
+            node_idxs = batch["node_idxs"]
+            f2p_nbr_idxs = batch["f2p_nbr_idxs"]
+            col_name_idxs = batch["col_name_idxs"]
+            table_name_idxs = batch["table_name_idxs"]
+
+        # ---- ATTENTION MASKS (now using padded seq_len if we padded) ----
         pad = (~is_padding[:, :, None]) & (~is_padding[:, None, :])  # (B, S, S)
-        
-        # Cells in the same node
-        same_node = node_idxs[:, :, None] == node_idxs[:, None, :]  # (B, S, S)
-        
-        # kv index is among q's foreign -> primary neighbors
-        kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(-1)  # (B, S, S)
-        
-        # q index is among kv's primary -> foreign neighbors (reverse relation)
-        q_in_f2p = (node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]).any(-1)  # (B, S, S)
-        
-        # Same column AND same table
-        same_col_table = (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) & (
-            table_name_idxs[:, :, None] == table_name_idxs[:, None, :]
-        )  # (B, S, S)
-        
-        # Final boolean masks
+
+        same_node = node_idxs[:, :, None] == node_idxs[:, None, :]   # (B, S, S)
+
+        kv_in_f2p = (
+            node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]
+        ).any(-1)                                                    # (B, S, S)
+
+        q_in_f2p = (
+            node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]
+        ).any(-1)                                                    # (B, S, S)
+
+        same_col_table = (
+            (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) &
+            (table_name_idxs[:, :, None] == table_name_idxs[:, None, :])
+        )                                                            # (B, S, S)
+
         attn_masks = {
             "feat": (same_node | kv_in_f2p) & pad,
-            "nbr": q_in_f2p & pad,
-            "col": same_col_table & pad,
+            "nbr":  q_in_f2p & pad,
+            "col":  same_col_table & pad,
             "full": pad,
         }
-        
-        # Make contiguous for better performance
-        for l in attn_masks:
-            attn_masks[l] = attn_masks[l].contiguous()
-        
-        # Convert to block masks
+
+        for k in attn_masks:
+            attn_masks[k] = attn_masks[k].contiguous()
+
+        # ---- BLOCK MASKS (flex-attention) ----
         from functools import partial
         make_block_mask = partial(
             _make_block_mask,
             batch_size=batch_size,
-            seq_len=seq_len,
+            seq_len=seq_len,   # NOTE: padded seq_len if needs_padding
             device=device,
         )
-        block_masks = {
-            l: make_block_mask(attn_mask) for l, attn_mask in attn_masks.items()
-        }
-        
-        # Encode cells (same as RT)
+        block_masks = {k: make_block_mask(m) for k, m in attn_masks.items()}
+
+        # ---- ENCODING (same as RT) ----
+        expected_S = seq_len
+        if batch["sem_types"].shape[1] != expected_S:
+            raise RuntimeError(
+                f"sem_types length mismatch: expected {expected_S}, "
+                f"got {batch['sem_types'].shape[1]}"
+            )
+        if batch["masks"].shape[1] != expected_S:
+            raise RuntimeError(
+                f"masks length mismatch: expected {expected_S}, "
+                f"got {batch['masks'].shape[1]}"
+            )
+
         x = 0
+        col_name_values = batch["col_name_values"]
+        if col_name_values.shape[1] != expected_S:
+            raise RuntimeError(
+                f"col_name_values length mismatch: expected {expected_S}, "
+                f"got {col_name_values.shape[1]}"
+            )
+
         x = x + (
             self.rt_model.norm_dict["col_name"](
-                self.rt_model.enc_dict["col_name"](batch["col_name_values"])
-            )
-            * (~is_padding)[..., None]
+                self.rt_model.enc_dict["col_name"](col_name_values)
+            ) * (~is_padding)[..., None]
         )
-        
+
         for i, t in enumerate(["number", "text", "datetime", "boolean"]):
+            value_key = t + "_values"
+            if value_key not in batch:
+                continue
+            values = batch[value_key]
+            if values.shape[1] != expected_S:
+                raise RuntimeError(
+                    f"{value_key} length mismatch: expected {expected_S}, "
+                    f"got {values.shape[1]}"
+                )
+
             x = x + (
-                self.rt_model.norm_dict[t](self.rt_model.enc_dict[t](batch[t + "_values"]))
+                self.rt_model.norm_dict[t](self.rt_model.enc_dict[t](values))
                 * ((batch["sem_types"] == i) & ~batch["masks"] & ~is_padding)[..., None]
             )
             x = x + (
                 self.rt_model.mask_embs[t]
                 * ((batch["sem_types"] == i) & batch["masks"] & ~is_padding)[..., None]
             )
-        
-        # Relational blocks
+
+        # ---- RELATIONAL BLOCKS ----
         for block in self.rt_model.blocks:
             x = block(x, block_masks)
-        
-        # Final norm (this is what we return - embeddings)
+
+        # ---- FINAL NORM ----
         x = self.rt_model.norm_out(x)
-        
-        return x  # (B, S, d_model)
+
+        # ---- UNPAD BACK TO ORIGINAL SEQ_LEN ----
+        if needs_padding:
+            x = x[:, :original_seq_len, :]  # (B, S_orig, d_model)
+
+        return x
 
 
 class HeteroDataToRTBatch:
@@ -174,19 +286,39 @@ class HeteroDataToRTBatch:
     def _get_table_idx(self, table_name: str) -> int:
         """Get table name index."""
         return self.table_name_to_idx.get(table_name, 0)
-    
+        
     def _get_text_embedding(self, text_value) -> np.ndarray:
-        """Get text embedding for a cell value."""
+        """Get text embedding for a cell value. Always returns numpy array of length self.d_text."""
         if self.text_embedder is not None:
             try:
                 emb = self.text_embedder([str(text_value)])
+                if isinstance(emb, Tensor):
+                    emb = emb.detach().cpu().numpy()
                 if isinstance(emb, np.ndarray):
-                    return emb[0] if emb.ndim > 1 else emb
-                return emb[0] if isinstance(emb, list) else emb
-            except:
+                    result = emb[0] if emb.ndim > 1 else emb
+                elif isinstance(emb, list):
+                    result = emb[0]
+                else:
+                    result = emb
+
+                if isinstance(result, Tensor):
+                    result = result.detach().cpu().numpy()
+
+                vec = np.asarray(result, dtype=np.float32)
+
+                d = vec.shape[-1]
+                if d < self.d_text:
+                    vec = np.pad(vec, (0, self.d_text - d), mode="constant")
+                elif d > self.d_text:
+                    vec = vec[: self.d_text]
+
+                return vec
+            except Exception:
                 pass
-        # Return zero embedding as fallback
+
+        # Fallback
         return np.zeros(self.d_text, dtype=np.float32)
+
     
     def _compute_f2p_neighbors(
         self, 
@@ -200,7 +332,20 @@ class HeteroDataToRTBatch:
         Returns:
             f2p_nbr_idxs: (1, S, 5) - max 5 neighbors per cell
         """
-        device = batch[list(batch.node_types)[0]].seed_time.device
+        # Get device from any available tensor in the batch
+        device = None
+        for node_type in batch.node_types:
+            if hasattr(batch[node_type], 'x') and batch[node_type].x is not None:
+                device = batch[node_type].x.device
+                break
+            if hasattr(batch[node_type], 'seed_time') and batch[node_type].seed_time is not None:
+                device = batch[node_type].seed_time.device
+                break
+            if hasattr(batch[node_type], 'time') and batch[node_type].time is not None:
+                device = batch[node_type].time.device
+                break
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         seq_len = len(node_idxs_list)
         max_neighbors = 5
         
@@ -246,280 +391,297 @@ class HeteroDataToRTBatch:
         
         return f2p_nbr_idxs
     
+    
     def convert(
         self,
         batch: HeteroData,
         entity_table: NodeType,
-        batch_size: int
+        batch_size: int,
     ) -> Dict[str, Tensor]:
         """
         Convert HeteroData batch to RT batch format.
-        
-        Args:
-            batch: HeteroData from NeighborLoader
-            entity_table: Target entity table name
-            batch_size: Number of target entities
-            
-        Returns:
-            rt_batch: Dict with RT-required fields
+
+        * node_idxs are LOCAL per table: 0 .. num_nodes(table)-1
+        * all *_values have shape (1, S, ...)
         """
         self._build_mappings(batch)
         device = batch[entity_table].seed_time.device
-        
-        # Extract cells from TensorFrame
-        all_cells = []
-        node_idxs_list = []
-        col_name_idxs_list = []
-        table_name_idxs_list = []
-        sem_types_list = []
-        
-        cell_idx = 0
-        node_idx_offset = {}  # Track node index offsets per table
-        
+
+        all_cells: List[dict] = []
+        node_idxs_list: List[int] = []
+        col_name_idxs_list: List[int] = []
+        table_name_idxs_list: List[int] = []
+        sem_types_list: List[int] = []
+
+        # ---- First pass: enumerate all cells ----
         for node_type in batch.node_types:
             tf = batch.tf_dict[node_type]
             num_nodes = len(tf)
-            
-            # Track node index offset for this table
-            node_idx_offset[node_type] = cell_idx
-            
-            # Extract cells from TensorFrame
+            table_idx = self._get_table_idx(node_type)
+
             for node_idx_in_table in range(num_nodes):
-                # Map to global node index
-                global_node_idx = cell_idx
-                
+                # node_idx is LOCAL to this table
+                node_idx = node_idx_in_table
+
                 for stype_name, feat in tf.feat_dict.items():
                     col_names = tf.col_names_dict.get(stype_name, [])
-                    
+
                     if stype_name == stype.numerical:
-                        # Numerical columns
                         if isinstance(feat, Tensor):
-                            for col_idx, col_name in enumerate(col_names):
-                                value = feat[node_idx_in_table, col_idx].item()
+                            for col_j, col_name in enumerate(col_names):
+                                value = feat[node_idx_in_table, col_j].item()
                                 all_cells.append({
-                                    'value': value,
-                                    'sem_type': 0,  # number
-                                    'node_idx': global_node_idx,
-                                    'col_name': col_name,
-                                    'table_name': node_type,
+                                    "value": value,
+                                    "sem_type": 0,  # number
+                                    "node_idx": node_idx,
+                                    "col_name": col_name,
+                                    "table_name": node_type,
                                 })
-                                node_idxs_list.append(global_node_idx)
+                                node_idxs_list.append(node_idx)
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
-                                table_name_idxs_list.append(self._get_table_idx(node_type))
+                                table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(0)
-                    
+
                     elif stype_name == stype.categorical:
-                        # Categorical columns (treat as number - category index)
                         if isinstance(feat, Tensor):
-                            for col_idx, col_name in enumerate(col_names):
-                                value = feat[node_idx_in_table, col_idx].item()
+                            for col_j, col_name in enumerate(col_names):
+                                value = feat[node_idx_in_table, col_j].item()
                                 all_cells.append({
-                                    'value': float(value),
-                                    'sem_type': 0,  # number
-                                    'node_idx': global_node_idx,
-                                    'col_name': col_name,
-                                    'table_name': node_type,
+                                    "value": float(value),
+                                    "sem_type": 0,  # treat as number
+                                    "node_idx": node_idx,
+                                    "col_name": col_name,
+                                    "table_name": node_type,
                                 })
-                                node_idxs_list.append(global_node_idx)
+                                node_idxs_list.append(node_idx)
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
-                                table_name_idxs_list.append(self._get_table_idx(node_type))
+                                table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(0)
-                    
+
                     elif stype_name == stype.text_embedded:
-                        # Text embedded columns
                         if isinstance(feat, torch_frame.data.MultiEmbeddingTensor):
-                            for col_idx, col_name in enumerate(col_names):
-                                offset = feat.offset
-                                start_idx = offset[node_idx_in_table * len(col_names) + col_idx]
-                                end_idx = offset[node_idx_in_table * len(col_names) + col_idx + 1]
+                            offset = feat.offset
+                            for col_j, col_name in enumerate(col_names):
+                                start_idx = offset[node_idx_in_table * len(col_names) + col_j]
+                                end_idx = offset[node_idx_in_table * len(col_names) + col_j + 1]
                                 value = feat.values[start_idx:end_idx].cpu().numpy()
-                                
+
                                 all_cells.append({
-                                    'value': value,
-                                    'sem_type': 1,  # text
-                                    'node_idx': global_node_idx,
-                                    'col_name': col_name,
-                                    'table_name': node_type,
+                                    "value": value,
+                                    "sem_type": 1,  # text
+                                    "node_idx": node_idx,
+                                    "col_name": col_name,
+                                    "table_name": node_type,
                                 })
-                                node_idxs_list.append(global_node_idx)
+                                node_idxs_list.append(node_idx)
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
-                                table_name_idxs_list.append(self._get_table_idx(node_type))
+                                table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(1)
-                    
+
                     elif stype_name == stype.timestamp:
-                        # Timestamp columns (treat as datetime)
+                        # Timestamp -> scalar datetime
                         if isinstance(feat, Tensor):
-                            for col_idx, col_name in enumerate(col_names):
-                                value = feat[node_idx_in_table, col_idx].item()
+                            for col_j, col_name in enumerate(col_names):
+                                feat_val = feat[node_idx_in_table, col_j]
+                                if feat_val.dim() == 0:
+                                    value = feat_val.item()
+                                else:
+                                    comps = feat_val.float()
+                                    year = comps[0].item() if comps.numel() > 0 else 2000
+                                    month = comps[1].item() if comps.numel() > 1 else 1
+                                    day = comps[2].item() if comps.numel() > 2 else 1
+                                    value = (year - 2000) * 365 + month * 30 + day
+
                                 all_cells.append({
-                                    'value': value,
-                                    'sem_type': 2,  # datetime
-                                    'node_idx': global_node_idx,
-                                    'col_name': col_name,
-                                    'table_name': node_type,
+                                    "value": value,
+                                    "sem_type": 2,  # datetime
+                                    "node_idx": node_idx,
+                                    "col_name": col_name,
+                                    "table_name": node_type,
                                 })
-                                node_idxs_list.append(global_node_idx)
+                                node_idxs_list.append(node_idx)
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
-                                table_name_idxs_list.append(self._get_table_idx(node_type))
+                                table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(2)
-                
-                cell_idx += 1
-        
-        # Convert to RT batch format
+
+        # ---- Handle empty graph ----
         seq_len = len(all_cells)
-        
         if seq_len == 0:
-            # Return empty batch
             return {
-                'node_idxs': torch.zeros(1, 0, dtype=torch.long, device=device),
-                'col_name_idxs': torch.zeros(1, 0, dtype=torch.long, device=device),
-                'table_name_idxs': torch.zeros(1, 0, dtype=torch.long, device=device),
-                'sem_types': torch.zeros(1, 0, dtype=torch.long, device=device),
-                'is_padding': torch.ones(1, 0, dtype=torch.bool, device=device),
-                'masks': torch.zeros(1, 0, dtype=torch.bool, device=device),
-                'f2p_nbr_idxs': torch.full((1, 0, 5), -1, dtype=torch.long, device=device),
-                'number_values': torch.zeros(1, 0, 1, device=device),
-                'text_values': torch.zeros(1, 0, self.d_text, device=device),
-                'datetime_values': torch.zeros(1, 0, 1, device=device),
-                'boolean_values': torch.zeros(1, 0, 1, device=device),
-                'col_name_values': torch.zeros(1, 0, self.d_text, device=device),
+                "node_idxs":       torch.zeros(1, 0, dtype=torch.long, device=device),
+                "col_name_idxs":   torch.zeros(1, 0, dtype=torch.long, device=device),
+                "table_name_idxs": torch.zeros(1, 0, dtype=torch.long, device=device),
+                "sem_types":       torch.zeros(1, 0, dtype=torch.long, device=device),
+                "is_padding":      torch.ones(1, 0, dtype=torch.bool, device=device),
+                "masks":           torch.zeros(1, 0, dtype=torch.bool, device=device),
+                "f2p_nbr_idxs":    torch.full((1, 0, 5), -1, dtype=torch.long, device=device),
+                "number_values":   torch.zeros(1, 0, 1, device=device),
+                "text_values":     torch.zeros(1, 0, self.d_text, device=device),
+                "datetime_values": torch.zeros(1, 0, 1, device=device),
+                "boolean_values":  torch.zeros(1, 0, 1, device=device),
+                "col_name_values": torch.zeros(1, 0, self.d_text, device=device),
             }
-        
-        # Build RT batch dict
-        rt_batch = {
-            'node_idxs': torch.tensor(node_idxs_list, device=device).unsqueeze(0),  # (1, S)
-            'col_name_idxs': torch.tensor(col_name_idxs_list, device=device).unsqueeze(0),
-            'table_name_idxs': torch.tensor(table_name_idxs_list, device=device).unsqueeze(0),
-            'sem_types': torch.tensor(sem_types_list, device=device).unsqueeze(0),
-            'is_padding': torch.zeros(1, seq_len, dtype=torch.bool, device=device),
-            'masks': torch.zeros(1, seq_len, dtype=torch.bool, device=device),  # No masking for inference
-        }
-        
-        # Extract cell values by semantic type
-        number_values = []
-        text_values = []
-        datetime_values = []
-        boolean_values = []
-        col_name_values = []
-        
+
+        # ---- Second pass: build aligned value arrays (length = seq_len) ----
+        number_rows:   List[np.ndarray] = []
+        text_rows:     List[np.ndarray] = []
+        datetime_rows: List[np.ndarray] = []
+        boolean_rows:  List[np.ndarray] = []
+        colname_rows:  List[np.ndarray] = []
+
         for cell in all_cells:
-            col_name_emb = self._get_text_embedding(cell['col_name'])
-            col_name_values.append(col_name_emb)
-            
-            if cell['sem_type'] == 0:  # number
-                number_values.append([cell['value']])
-            elif cell['sem_type'] == 1:  # text
-                if isinstance(cell['value'], np.ndarray):
-                    text_values.append(cell['value'])
+            colname_rows.append(self._get_text_embedding(cell["col_name"]))  # always filled
+
+            st = cell["sem_type"]
+            v  = cell["value"]
+
+            if st == 0:  # number
+                number_rows.append(np.array([float(v)], dtype=np.float32))
+                text_rows.append(np.zeros(self.d_text, dtype=np.float32))
+                datetime_rows.append(np.zeros(1, dtype=np.float32))
+                boolean_rows.append(np.zeros(1, dtype=np.float32))
+
+            elif st == 1:  # text
+                if isinstance(v, np.ndarray):
+                    vec = v.astype(np.float32)
                 else:
-                    text_values.append(self._get_text_embedding(cell['value']))
-            elif cell['sem_type'] == 2:  # datetime
-                datetime_values.append([cell['value']])
-            elif cell['sem_type'] == 3:  # boolean
-                boolean_values.append([float(cell['value'] > 0)])
-        
-        # Convert to tensors
-        rt_batch['number_values'] = torch.tensor(
-            number_values, device=device, dtype=torch.float32
-        ).unsqueeze(0) if number_values else torch.zeros(1, 0, 1, device=device)
-        
-        rt_batch['text_values'] = torch.tensor(
-            text_values, device=device, dtype=torch.float32
-        ).unsqueeze(0) if text_values else torch.zeros(1, 0, self.d_text, device=device)
-        
-        rt_batch['datetime_values'] = torch.tensor(
-            datetime_values, device=device, dtype=torch.float32
-        ).unsqueeze(0) if datetime_values else torch.zeros(1, 0, 1, device=device)
-        
-        rt_batch['boolean_values'] = torch.tensor(
-            boolean_values, device=device, dtype=torch.float32
-        ).unsqueeze(0) if boolean_values else torch.zeros(1, 0, 1, device=device)
-        
-        rt_batch['col_name_values'] = torch.tensor(
-            col_name_values, device=device, dtype=torch.float32
-        ).unsqueeze(0) if col_name_values else torch.zeros(1, 0, self.d_text, device=device)
-        
-        # Compute f2p_nbr_idxs from edge_index_dict
-        rt_batch['f2p_nbr_idxs'] = self._compute_f2p_neighbors(
+                    vec = self._get_text_embedding(v)
+                # ensure length d_text
+                if vec.shape[-1] < self.d_text:
+                    vec = np.pad(vec, (0, self.d_text - vec.shape[-1]), mode="constant")
+                elif vec.shape[-1] > self.d_text:
+                    vec = vec[: self.d_text]
+                number_rows.append(np.zeros(1, dtype=np.float32))
+                text_rows.append(vec)
+                datetime_rows.append(np.zeros(1, dtype=np.float32))
+                boolean_rows.append(np.zeros(1, dtype=np.float32))
+
+            elif st == 2:  # datetime
+                number_rows.append(np.zeros(1, dtype=np.float32))
+                text_rows.append(np.zeros(self.d_text, dtype=np.float32))
+                datetime_rows.append(np.array([float(v)], dtype=np.float32))
+                boolean_rows.append(np.zeros(1, dtype=np.float32))
+
+            elif st == 3:  # boolean
+                number_rows.append(np.zeros(1, dtype=np.float32))
+                text_rows.append(np.zeros(self.d_text, dtype=np.float32))
+                datetime_rows.append(np.zeros(1, dtype=np.float32))
+                boolean_rows.append(np.array([float(v > 0)], dtype=np.float32))
+
+            else:
+                # Fallback: everything zero
+                number_rows.append(np.zeros(1, dtype=np.float32))
+                text_rows.append(np.zeros(self.d_text, dtype=np.float32))
+                datetime_rows.append(np.zeros(1, dtype=np.float32))
+                boolean_rows.append(np.zeros(1, dtype=np.float32))
+
+        # Stack to numpy arrays, then to tensors (B=1)
+        number_arr   = np.stack(number_rows,   axis=0)   # (S, 1)
+        text_arr     = np.stack(text_rows,     axis=0)   # (S, d_text)
+        datetime_arr = np.stack(datetime_rows, axis=0)   # (S, 1)
+        boolean_arr  = np.stack(boolean_rows,  axis=0)   # (S, 1)
+        colname_arr  = np.stack(colname_rows,  axis=0)   # (S, d_text)
+
+        rt_batch = {
+            "node_idxs":       torch.tensor(node_idxs_list,       device=device, dtype=torch.long).unsqueeze(0),
+            "col_name_idxs":   torch.tensor(col_name_idxs_list,   device=device, dtype=torch.long).unsqueeze(0),
+            "table_name_idxs": torch.tensor(table_name_idxs_list, device=device, dtype=torch.long).unsqueeze(0),
+            "sem_types":       torch.tensor(sem_types_list,       device=device, dtype=torch.long).unsqueeze(0),
+            "is_padding":      torch.zeros(1, seq_len, dtype=torch.bool, device=device),
+            "masks":           torch.zeros(1, seq_len, dtype=torch.bool, device=device),
+            "number_values":   torch.tensor(number_arr,   device=device, dtype=torch.float32).unsqueeze(0),
+            "text_values":     torch.tensor(text_arr,     device=device, dtype=torch.float32).unsqueeze(0),
+            "datetime_values": torch.tensor(datetime_arr, device=device, dtype=torch.float32).unsqueeze(0),
+            "boolean_values":  torch.tensor(boolean_arr,  device=device, dtype=torch.float32).unsqueeze(0),
+            "col_name_values": torch.tensor(colname_arr,  device=device, dtype=torch.float32).unsqueeze(0),
+        }
+
+        # f2p_nbr_idxs uses LOCAL node indices (0..num_nodes-1) per table
+        rt_batch["f2p_nbr_idxs"] = self._compute_f2p_neighbors(
             batch, node_idxs_list, table_name_idxs_list
         )
-        
+
         return rt_batch
 
 
 def aggregate_cells_to_nodes(
-    cell_embeds: Tensor,  # (B, S, d_model)
+    cell_embeds: Tensor,  # (B, S, d_model) - may be unpadded
     rt_batch: Dict[str, Tensor],
     batch: HeteroData,
     entity_table: NodeType,
     aggr: str = "sum"
 ) -> Dict[NodeType, Tensor]:
-    """
-    Aggregate RT cell embeddings to node-level embeddings.
-    
-    Args:
-        cell_embeds: RT encoder output (B, S, d_model)
-        rt_batch: RT batch dict with node_idxs, table_name_idxs
-        batch: Original HeteroData batch
-        entity_table: Target entity table
-        aggr: Aggregation method ("sum", "mean", "max")
-        
-    Returns:
-        x_dict: Dict[NodeType, Tensor] with (num_nodes, d_model)
-    """
     device = cell_embeds.device
-    node_idxs = rt_batch['node_idxs'][0]  # (S,)
-    table_name_idxs = rt_batch['table_name_idxs'][0]  # (S,)
-    cell_embeds = cell_embeds[0]  # (S, d_model)
-    
-    # Build reverse mapping: table_idx -> table_name
-    table_idx_to_name = {}
-    for idx, node_type in enumerate(batch.node_types):
-        table_idx_to_name[idx] = node_type
-    
-    x_dict = {}
-    
-    for node_type in batch.node_types:
-        table_idx = list(batch.node_types).index(node_type)
+    B, S, d_model = cell_embeds.shape
+    assert B == 1, f"Expected batch size 1, got {B}"
+    cell_embeds = cell_embeds[0]  # (S_unpadded, d_model)
+
+    node_idxs = rt_batch['node_idxs'][0]          # (S_padded,)
+    table_name_idxs = rt_batch['table_name_idxs'][0]  # (S_padded,)
+
+    # Unpad indices to match cell_embeds length
+    actual_seq_len = cell_embeds.shape[0]
+    if node_idxs.shape[0] > actual_seq_len:
+        node_idxs = node_idxs[:actual_seq_len]
+        table_name_idxs = table_name_idxs[:actual_seq_len]
+
+    x_dict: Dict[NodeType, Tensor] = {}
+
+    for table_idx, node_type in enumerate(batch.node_types):
+        tf = batch.tf_dict[node_type]
+        num_nodes = len(tf)  # number of nodes for this type in this batch
+
+        # Select cells of this table
         mask = (table_name_idxs == table_idx)
-        
         if not mask.any():
-            # No cells for this node type
-            x_dict[node_type] = torch.zeros(0, cell_embeds.shape[-1], device=device)
+            # No cells at all for this table -> all-zero embeddings, but keep num_nodes
+            x_dict[node_type] = torch.zeros(num_nodes, d_model, device=device)
             continue
-        
-        # Get cells for this table
-        table_node_idxs = node_idxs[mask]
-        table_cell_embeds = cell_embeds[mask]
-        
-        # Group cells by node_idx
-        node_embeds_dict = {}
-        for i, node_idx in enumerate(table_node_idxs):
-            node_idx_val = node_idx.item() if isinstance(node_idx, Tensor) else node_idx
-            if node_idx_val not in node_embeds_dict:
-                node_embeds_dict[node_idx_val] = []
-            node_embeds_dict[node_idx_val].append(table_cell_embeds[i])
-        
-        # Aggregate (match Rel-LLM's aggregation method)
-        if node_embeds_dict:
-            aggregated = []
-            for node_idx in sorted(node_embeds_dict.keys()):
-                cells = torch.stack(node_embeds_dict[node_idx])
-                if aggr == "sum":
-                    aggregated.append(cells.sum(dim=0))
-                elif aggr == "mean":
-                    aggregated.append(cells.mean(dim=0))
-                elif aggr == "max":
-                    aggregated.append(cells.max(dim=0)[0])
-                else:
-                    raise ValueError(f"Unknown aggregation method: {aggr}. Must be 'sum', 'mean', or 'max'.")
-            
-            if aggregated:
-                x_dict[node_type] = torch.stack(aggregated)
-            else:
-                x_dict[node_type] = torch.zeros(0, cell_embeds.shape[-1], device=device)
+
+        table_node_idxs = node_idxs[mask]      # (S_table,)
+        table_cell_embeds = cell_embeds[mask]  # (S_table, d_model)
+
+        # Sanity: local node indices must be in [0, num_nodes)
+        if table_node_idxs.numel() > 0:
+            max_idx = int(table_node_idxs.max().item())
+            if max_idx >= num_nodes:
+                raise RuntimeError(
+                    f"Node index out of range for node_type={node_type}: "
+                    f"max_idx={max_idx}, num_nodes={num_nodes}"
+                )
+
+        # Initialize one embedding per node
+        node_embeds = torch.zeros(num_nodes, d_model, device=device)
+
+        if aggr in ("sum", "mean"):
+            counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
+
+            for emb, n_idx in zip(table_cell_embeds, table_node_idxs):
+                idx = int(n_idx.item())
+                node_embeds[idx] += emb
+                counts[idx] += 1
+
+            if aggr == "mean":
+                mask_nonzero = counts > 0
+                node_embeds[mask_nonzero] = (
+                    node_embeds[mask_nonzero] / counts[mask_nonzero].unsqueeze(-1)
+                )
+
+        elif aggr == "max":
+            counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
+            node_embeds[:] = -1e9
+            for emb, n_idx in zip(table_cell_embeds, table_node_idxs):
+                idx = int(n_idx.item())
+                node_embeds[idx] = torch.maximum(node_embeds[idx], emb)
+                counts[idx] += 1
+            # Nodes with no cells -> set back to zero
+            mask_zero = counts == 0
+            node_embeds[mask_zero] = 0.0
         else:
-            x_dict[node_type] = torch.zeros(0, cell_embeds.shape[-1], device=device)
-    
+            raise ValueError(f"Unknown aggregation method: {aggr}")
+
+        x_dict[node_type] = node_embeds
+
     return x_dict
+
 

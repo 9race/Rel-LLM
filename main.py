@@ -71,10 +71,11 @@ if __name__ == '__main__':
     # RT encoder
     parser.add_argument("--use_rt_encoder", action='store_true', help="Use Relational Transformer encoder instead of GNN")
     parser.add_argument("--rt_num_blocks", type=int, default=4, help="Number of RT transformer blocks")
-    parser.add_argument("--rt_d_model", type=int, default=512, help="RT model dimension")
+    parser.add_argument("--rt_d_model", type=int, default=256, help="RT model dimension (pretrained uses 256)")
     parser.add_argument("--rt_d_text", type=int, default=384, help="RT text embedding dimension")
     parser.add_argument("--rt_num_heads", type=int, default=8, help="Number of attention heads in RT")
-    parser.add_argument("--rt_d_ff", type=int, default=2048, help="RT feed-forward dimension")
+    parser.add_argument("--rt_d_ff", type=int, default=1024, help="RT feed-forward dimension (pretrained uses 1024)")
+    parser.add_argument("--rt_max_seq_len", type=int, default=2048, help="Maximum sequence length for RT encoder (to prevent OOM, default 2048)")
     parser.add_argument("--rt_pretrained_path", type=str, default=None, help="Path to RT pretrained checkpoint")
 
     # LLMs
@@ -165,6 +166,7 @@ if __name__ == '__main__':
             'd_text': args.rt_d_text,
             'num_heads': args.rt_num_heads,
             'd_ff': args.rt_d_ff,
+            'max_seq_len': args.rt_max_seq_len,
             'pretrained_path': args.rt_pretrained_path,
         }
     
