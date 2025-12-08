@@ -74,7 +74,9 @@ class Model(torch.nn.Module):
                 # Wrap for encoder-only output
                 self.rt_encoder = RTEncoderOnly(self.rt_model)
                 
-                # Adapter for data conversion
+                # NOTE: HeteroDataToRTBatch is kept for reference but NOT USED when RT sampler is enabled
+                # RT sampler returns RT batch format directly - no conversion needed
+                # This adapter is only kept for backward compatibility (not used in RT sampler path)
                 self.rt_adapter = HeteroDataToRTBatch(
                     col_stats_dict=col_stats_dict,
                     text_embedder=text_embedder,
@@ -85,11 +87,6 @@ class Model(torch.nn.Module):
                 rt_d_model = rt_config.get('d_model', 512)
                 self.rt_to_channels = Linear(rt_d_model, channels)
                 
-                # Maximum sequence length for RT encoder (to prevent OOM)
-                # RT uses seq_len=1024, but we allow configurable limit
-                # Memory scales as O(S²) for attention masks, so limit conservatively
-                self.rt_max_seq_len = rt_config.get('max_seq_len', 2048)
-                
                 # Load pretrained weights if available
                 if rt_config.get('pretrained_path'):
                     try:
@@ -99,7 +96,13 @@ class Model(torch.nn.Module):
                     except Exception as e:
                         print(f"Warning: Could not load RT pretrained weights: {e}")
                 
-                print(f"Using RT encoder: d_model={rt_d_model}, num_blocks={rt_config.get('num_blocks', 4)}, max_seq_len={self.rt_max_seq_len}")
+                # Convert RT model to bfloat16 (matching RT's behavior: net = net.to(torch.bfloat16))
+                # RT's dataset outputs bfloat16 values, so model must also be bfloat16
+                self.rt_model = self.rt_model.to(torch.bfloat16)
+                # Update the wrapper to use the converted model
+                self.rt_encoder = RTEncoderOnly(self.rt_model)
+                
+                print(f"Using RT encoder: d_model={rt_d_model}, num_blocks={rt_config.get('num_blocks', 4)}")
             else:
                 print("Warning: relational-transformer not found. Falling back to GNN.")
                 self.use_rt_encoder = False
@@ -227,52 +230,238 @@ class Model(torch.nn.Module):
             return torch.cuda.amp.autocast(dtype=dtype)
         return contextlib.nullcontext()
 
-    def encode(self, batch, entity_table):
-        seed_time = batch[entity_table].seed_time  # seed time indicates at which time the target is to be predicted, filtering future data.
-        batch_size = len(seed_time)
+    def encode(self, batch, entity_table, split=None):
+        """
+        Encode batch to node embeddings.
         
-        if self.use_rt_encoder:
-            # RT encoder path
-            # Convert HeteroData → RT batch format
-            rt_batch = self.rt_adapter.convert(batch, entity_table, batch_size)
-            
-            # Truncate sequence if too long to prevent OOM
-            # Memory scales as O(S²) for attention masks, so limit sequence length
-            seq_len = rt_batch['node_idxs'].shape[1]
-            if seq_len > self.rt_max_seq_len:
-                print(f"Warning: Truncating RT sequence from {seq_len} to {self.rt_max_seq_len} to prevent OOM")
-                # Truncate all batch tensors consistently
-                for k, v in rt_batch.items():
-                    if isinstance(v, torch.Tensor) and v.dim() >= 2:
-                        if v.shape[1] == seq_len:  # Sequence dimension
-                            rt_batch[k] = v[:, :self.rt_max_seq_len]
-                        elif v.shape[1] > seq_len:  # Multi-dimensional (e.g., f2p_nbr_idxs)
-                            # For 3D tensors like f2p_nbr_idxs: (B, S, 5)
-                            rt_batch[k] = v[:, :self.rt_max_seq_len, :]
-            
-            # RT forward (encoder only)
-            cell_embeds = self.rt_encoder(rt_batch)  # (B, S, d_model)
-            
-            # Aggregate cells → nodes (using same aggregation as Rel-LLM GNN)
-            x_dict = aggregate_cells_to_nodes(
-                cell_embeds, rt_batch, batch, entity_table, aggr=self.aggr
-            )
-            
-            # Project to channels dimension
-            x_dict = {
-                node_type: self.rt_to_channels(emb)
-                for node_type, emb in x_dict.items()
-            }
-        else:
-            # Original HeteroEncoder path
-            x_dict = self.encoder(batch.tf_dict)  # encode interactions within each table (tensor_frame)
+        Args:
+            batch: Either HeteroData (from NeighborLoader) or RT batch dict (from RT sampler)
+            entity_table: Entity table name
+            split: Split name ("train", "val", "test") - needed for RT sampler
+        """
+        # Check if batch is RT format (dict) or HeteroData
+        is_rt_batch = isinstance(batch, dict) and 'node_idxs' in batch
 
-        # batch_dict -> index of each node in seed time (different from batch.batch!)
-        rel_time_dict = self.temporal_encoder(seed_time, batch.time_dict, batch.batch_dict)  # add time embedding to time-dependent node features
+        if is_rt_batch:
+            # RT batch from DataLoader (CPU tensors)
+            rt_batch_cpu = batch
+
+            if not hasattr(self, 'rt_bridge_dict') or split is None:
+                raise ValueError("RT batch format requires rt_bridge_dict and split")
+            bridge = self.rt_bridge_dict[split]
+            
+            # Clear previous seed node IDs to avoid stale data
+            self._rt_seed_node_ids = None
+            self._rt_seed_node_ids_per_batch = None
+
+            # ---------- 1) metadata on CPU ----------
+            if not hasattr(self, '_encode_call_count'):
+                self._encode_call_count = 0
+            if self._encode_call_count == 0:
+                print("[DEBUG] Building metadata from RT batch...", flush=True)
+
+            metadata = bridge.build_metadata(rt_batch_cpu, split)
+
+            if self._encode_call_count == 0:
+                print(f"[DEBUG] Metadata built, batch_size={metadata['batch_size']}", flush=True)
+
+            seed_time = metadata['seed_time']
+            n_id_dict = metadata['n_id']
+            time_dict = metadata['time_dict']
+            batch_dict = metadata['batch_dict']
+            
+            # Store n_id_dict for seed node mapping in forward()
+            self._rt_n_id_dict = n_id_dict
+            
+            # IMPORTANT: Use true_batch_size from RT sampler (number of seed examples)
+            # This is the actual batch size, not the number of unique nodes in subgraph
+            true_bs = rt_batch_cpu.get("true_batch_size", None)
+            if true_bs is not None:
+                batch_size = int(true_bs)
+                if self._encode_call_count == 0:
+                    print(f"[DEBUG] Overriding batch_size with true_batch_size={batch_size}", flush=True)
+            else:
+                # Fallback: use seed_time length
+                batch_size = seed_time.shape[0]
+                if self._encode_call_count == 0:
+                    print(f"[DEBUG] No true_batch_size found, using seed_time length={batch_size}", flush=True)
+            
+            # Keep seed_time length consistent with batch_size
+            seed_time = seed_time[:batch_size]
+
+            # ---------- 1.5) Extract seed node IDs and map to positions in x_dict ----------
+            # For precise seed node selection, we need to map seed node IDs to their positions in aggregated x_dict
+            # Extract seed node IDs from RT batch (is_task_nodes marks seed cells)
+            is_task_nodes = rt_batch_cpu['is_task_nodes']  # (B, S)
+            node_idxs = rt_batch_cpu['node_idxs']  # (B, S) - global node indices
+            table_name_idxs = rt_batch_cpu['table_name_idxs']  # (B, S)
+            
+            # Get table index for entity_table
+            entity_table_idx = bridge.node_type_to_table_idx.get(entity_table, None)
+            
+            seed_node_ids = []
+            for b in range(min(batch_size, is_task_nodes.shape[0])):
+                batch_is_task = is_task_nodes[b]  # (S,)
+                batch_node_idxs = node_idxs[b]  # (S,)
+                batch_table_idxs = table_name_idxs[b]  # (S,)
+                
+                # Find seed cells that belong to entity_table
+                seed_mask = batch_is_task & (batch_table_idxs == entity_table_idx)
+                seed_node_ids_batch = batch_node_idxs[seed_mask].unique()
+                seed_node_ids.append(seed_node_ids_batch)
+            
+            # Flatten and get unique seed node IDs
+            if seed_node_ids:
+                all_seed_node_ids = torch.cat(seed_node_ids).unique()
+            else:
+                all_seed_node_ids = torch.tensor([], dtype=torch.long)
+            
+            # Store seed node IDs for later use in forward()
+            self._rt_seed_node_ids = all_seed_node_ids
+            
+            # Store seed node IDs per batch item (in order) for label extraction
+            # This preserves the batch order needed for label_tokenize
+            self._rt_seed_node_ids_per_batch = []
+            for b in range(min(batch_size, is_task_nodes.shape[0])):
+                batch_is_task = is_task_nodes[b]  # (S,)
+                batch_node_idxs = node_idxs[b]  # (S,)
+                batch_table_idxs = table_name_idxs[b]  # (S,)
+                
+                # Find first seed cell that belongs to entity_table (one per batch item)
+                seed_mask = batch_is_task & (batch_table_idxs == entity_table_idx)
+                if seed_mask.any():
+                    seed_node_id = batch_node_idxs[seed_mask][0].item()  # Take first seed node
+                    self._rt_seed_node_ids_per_batch.append(seed_node_id)
+                else:
+                    # Fallback: shouldn't happen, but handle gracefully
+                    self._rt_seed_node_ids_per_batch.append(None)
+
+            # ---------- 2) move RT batch to device for RT encoder ----------
+            if self._encode_call_count == 0:
+                print("[DEBUG] Moving RT batch to device for RT encoder...", flush=True)
+
+            rt_batch_gpu = {
+                k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
+                for k, v in rt_batch_cpu.items()
+            }
+
+            if self._encode_call_count == 0:
+                print("[DEBUG] Calling RT encoder forward...", flush=True)
+
+            cell_embeds = self.rt_encoder(rt_batch_gpu)  # (B, S, d_model)
+
+            if self._encode_call_count == 0:
+                print(f"[DEBUG] RT encoder forward complete, cell_embeds shape={cell_embeds.shape}", flush=True)
+
+            # ---------- 3) aggregate cells → nodes ----------
+            from rt_adapter import aggregate_cells_to_nodes_from_rt_batch
+            if self._encode_call_count == 0:
+                print("[DEBUG] Aggregating cells to nodes...", flush=True)
+
+            x_dict = aggregate_cells_to_nodes_from_rt_batch(
+                cell_embeds,
+                rt_batch_cpu,                   # CPU batch contains table_ids / mapping
+                bridge.table_idx_to_node_type,
+                aggr=self.aggr,
+            )
+
+            if self._encode_call_count == 0:
+                print(f"[DEBUG] Aggregation complete, x_dict keys={list(x_dict.keys())}", flush=True)
+
+            # ---------- 4a) Remap RT task table names to Rel-LLM entity table names ----------
+            # RT uses task table names (e.g., "user-churn") but Rel-LLM expects entity table names (e.g., "customer")
+            # Map the RT task table name to the entity_table
+            remapped_x_dict = {}
+            if self._encode_call_count == 0:
+                print(f"[DEBUG] Remapping: rt_task_table_name={bridge.rt_task_table_name}, entity_table={entity_table}", flush=True)
+                print(f"[DEBUG] Available RT tables in batch: {list(x_dict.keys())}", flush=True)
+            
+            # Check if the expected task table is in the batch
+            if bridge.rt_task_table_name in x_dict:
+                # Map the task table to entity_table
+                remapped_x_dict[entity_table] = x_dict[bridge.rt_task_table_name]
+                if self._encode_call_count == 0:
+                    print(f"[DEBUG] Mapped {bridge.rt_task_table_name} -> {entity_table}", flush=True)
+            else:
+                # The expected task table is not in x_dict - this shouldn't happen but handle gracefully
+                # Try to find which table corresponds to entity_table by checking table_info
+                # For now, if we only have one table, assume it's the entity table
+                if len(x_dict) == 1:
+                    rt_table_name = list(x_dict.keys())[0]
+                    remapped_x_dict[entity_table] = x_dict[rt_table_name]
+                    if self._encode_call_count == 0:
+                        print(f"[DEBUG] WARNING: Expected {bridge.rt_task_table_name} but got {rt_table_name}, mapping to {entity_table}", flush=True)
+                else:
+                    # Multiple tables - need to figure out which one is the entity table
+                    # Check if any RT table name matches patterns that suggest it's the entity table
+                    # For user-churn task, entity_table is "customer", RT might use "user-churn" or similar
+                    found = False
+                    for rt_table_name, emb in x_dict.items():
+                        # Check if this RT table corresponds to our task
+                        if rt_table_name == bridge.rt_task_table_name or rt_table_name.startswith(bridge.rt_task_table_name.split('-')[0]):
+                            remapped_x_dict[entity_table] = emb
+                            found = True
+                            if self._encode_call_count == 0:
+                                print(f"[DEBUG] Mapped {rt_table_name} -> {entity_table} (pattern match)", flush=True)
+                            break
+                    
+                    if not found:
+                        # Last resort: use the first table and warn
+                        rt_table_name = list(x_dict.keys())[0]
+                        remapped_x_dict[entity_table] = x_dict[rt_table_name]
+                        if self._encode_call_count == 0:
+                            print(f"[DEBUG] WARNING: Could not find matching table, using first table {rt_table_name} -> {entity_table}", flush=True)
+            
+            # Keep other tables as-is (they might be other task tables or DB tables)
+            for rt_table_name, emb in x_dict.items():
+                if rt_table_name != bridge.rt_task_table_name:
+                    # Try to map if we have a mapping, otherwise keep RT name
+                    rel_llm_name = bridge.rt_to_relllm_table_map.get(rt_table_name, rt_table_name)
+                    if rel_llm_name != entity_table:  # Don't overwrite entity_table
+                        remapped_x_dict[rel_llm_name] = emb
+            
+            x_dict = remapped_x_dict
+
+            if self._encode_call_count == 0:
+                print(f"[DEBUG] After remapping, x_dict keys={list(x_dict.keys())}", flush=True)
+
+            self._encode_call_count += 1
+
+            # ---------- 4b) project RT d_model → channels ----------
+            x_dict = {node_type: self.rt_to_channels(emb) for node_type, emb in x_dict.items()}
+
+        else:
+            # HeteroData format (from NeighborLoader)
+            # If RT encoder is enabled, we should NEVER get HeteroData - RT sampler must be used
+            if self.use_rt_encoder:
+                raise ValueError(
+                    "RT encoder is enabled but received HeteroData batch. "
+                    "RT encoder REQUIRES RT sampler (not NeighborLoader). "
+                    "When --use_rt_encoder is set, RT's sampler is used automatically. "
+                    "HeteroDataToRTBatch conversion is NOT used - RT sampler returns RT batch format directly."
+                )
+            
+            # Original Rel-LLM path (GNN only, no RT encoder)
+            seed_time = batch[entity_table].seed_time
+            batch_size = len(seed_time)
+            x_dict = self.encoder(batch.tf_dict)  # HeteroEncoder
+            
+            # Use HeteroData metadata
+            n_id_dict = {node_type: batch[node_type].n_id for node_type in batch.node_types}
+            time_dict = batch.time_dict
+            batch_dict = batch.batch_dict
+
+        # Apply temporal encoding
+        rel_time_dict = self.temporal_encoder(seed_time, time_dict, batch_dict)
         for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
-        for node_type, embedding in self.embedding_dict.items():  # id embedding
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+            if node_type in x_dict:
+                x_dict[node_type] = x_dict[node_type] + rel_time
+        
+        # Apply ID embeddings
+        for node_type, embedding in self.embedding_dict.items():
+            if node_type in x_dict and node_type in n_id_dict:
+                x_dict[node_type] = x_dict[node_type] + embedding(n_id_dict[node_type])
+        
         return x_dict, batch_size
 
     def column_filter(self, df, df_name):
@@ -280,8 +469,29 @@ class Model(torch.nn.Module):
             self.column_keep[df_name] = [col for col in df.columns if infer_series_stype(df[col]) in accept_stypes]
         return self.column_keep[df_name]
 
-    def pretrain(self, batch, entity_table):
-        select_table = entity_table
+    def pretrain(self, batch, entity_table, split: Optional[str] = None):
+        # Handle RT batch format vs HeteroData
+        is_rt_batch = isinstance(batch, dict) and 'node_idxs' in batch
+        
+        # If RT encoder is enabled, we should NEVER get HeteroData
+        if self.use_rt_encoder and not is_rt_batch:
+            raise ValueError(
+                "RT encoder is enabled but received HeteroData batch in pretrain(). "
+                "RT encoder requires RT sampler (not NeighborLoader)."
+            )
+        
+        if is_rt_batch:
+            # RT batch - extract batch_size from metadata
+            if not hasattr(self, 'rt_bridge_dict') or split is None:
+                raise ValueError("RT batch requires rt_bridge_dict and split")
+            bridge = self.rt_bridge_dict[split]
+            _, batch_size = bridge.extract_seed_nodes(batch)
+            select_table = entity_table
+            # RT batches don't support pretraining masking yet - would need to implement
+            raise NotImplementedError("Pretraining with RT sampler not yet implemented")
+        else:
+            # Original HeteroData path (GNN only)
+            select_table = entity_table
         batch_size = len(batch[entity_table].seed_time)
         num_tokens_to_mask = int(batch_size * self.mask_ratio)  # Number of tokens to mask
         mask_indices = torch.randperm(batch_size)[:num_tokens_to_mask].to(self.device)
@@ -373,34 +583,92 @@ class Model(torch.nn.Module):
         attention_mask = attention_mask.to(device=self.model.device)
         label_input_ids = label_input_ids.to(device=self.model.device)
 
-        MAX_CTX = 2048
-        seq_len = inputs_embeds.size(1)
-        if seq_len > MAX_CTX:
-            inputs_embeds = inputs_embeds[:, -MAX_CTX:, :]
-            attention_mask = attention_mask[:, -MAX_CTX:]
-            label_input_ids = label_input_ids[:, -MAX_CTX:]
-            
         with self.maybe_autocast():
             outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True, labels=label_input_ids)
         return outputs.loss
 
-    def label_tokenize(self, batch, entity_table):
+    def label_tokenize(self, batch, entity_table, split=None):
+        """
+        Tokenize labels for label prompting.
+
+        HeteroData batches:
+            - use batch[entity_table].y (original Rel-LLM behavior)
+        RT batches:
+            - extract labels directly from RT batch using is_targets mask
+              and *_values tensors, without going through entity IDs.
+        """
+        is_rt_batch = isinstance(batch, dict) and 'node_idxs' in batch
+
+        if is_rt_batch:
+            if 'is_targets' not in batch:
+                raise ValueError("RT batch is missing 'is_targets'")
+
+            is_targets = batch['is_targets']          # (B, S)
+            B, S = is_targets.shape
+
+            # IMPORTANT: Use true_batch_size to avoid processing padding items
+            # RT pads batches to batch_size, but only first true_batch_size items are real
+            true_bs = batch.get("true_batch_size", B)
+            if true_bs > B:
+                # Sanity check: true_batch_size shouldn't exceed batch dimension
+                true_bs = B
+
+            label_values: List[float] = []
+
+            # Only process real batch items (not padding)
+            for b in range(true_bs):
+                mask = is_targets[b]                  # (S,)
+                if not mask.any():
+                    raise ValueError(f"No target cell found for RT batch item {b}")
+
+                if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
+                    if 'boolean_values' not in batch:
+                        raise ValueError("RT batch missing 'boolean_values' for binary task")
+                    vals = batch['boolean_values'][b][mask].view(-1)
+                    # take first target value
+                    v = vals[0].item()
+                    # assume >0.5 is True
+                    label_values.append(bool(v > 0.5))
+
+                elif self.task.task_type == TaskType.REGRESSION:
+                    if 'number_values' not in batch:
+                        raise ValueError("RT batch missing 'number_values' for regression task")
+                    vals = batch['number_values'][b][mask].view(-1)
+                    v = vals[0].item()
+                    label_values.append(float(v))
+
+                else:
+                    raise ValueError(f"Unsupported task type for RT label_tokenize: {self.task.task_type}")
+
+            # Now convert label_values → strings for tokenizer
+            if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
+                label_strs = ['Yes' if v else 'No' for v in label_values]
+            elif self.task.task_type == TaskType.REGRESSION:
+                label_strs = [str(v) for v in label_values]
+
+            labels = self.tokenizer(label_strs, add_special_tokens=False)
+            return labels
+
+        # ---------- Original HeteroData path ----------
         if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
-            label = ['Yes' if i else 'No' for i in batch[entity_table].y.bool().tolist()]  # convert 0/1 to true/false
-        elif self.task.task_type == TaskType.BINARY_CLASSIFICATION:
-            label = [str(i) for i in batch[entity_table].y.int().tolist()]  # int number
+            label = ['Yes' if i else 'No' for i in batch[entity_table].y.bool().tolist()]
+        elif self.task.task_type == TaskType.MULTICLASS_CLASSIFICATION:
+            # This branch is effectively unused in your current setup.
+            label = [str(i) for i in batch[entity_table].y.int().tolist()]
         elif self.task.task_type == TaskType.REGRESSION:
             label = [str(i) for i in batch[entity_table].y.float().tolist()]
+        else:
+            raise ValueError(f"Unsupported task type: {self.task.task_type}")
+
         labels = self.tokenizer(label, add_special_tokens=False)
         return labels
-
-    def get_demo_info(self, demo_batch, entity_table):
-        x_dict, demo_batch_size = self.encode(demo_batch, entity_table)
+    def get_demo_info(self, demo_batch, entity_table, split=None):
+        x_dict, demo_batch_size = self.encode(demo_batch, entity_table, split=split)
         assert self.num_demo <= demo_batch_size, 'Too large demo numbers!'
         if not self.use_rt_encoder:
             x_dict = self.gnn(x_dict, demo_batch.edge_index_dict)
         demo_node_embeds = self.projector(x_dict[entity_table][:demo_batch_size])
-        demo_labels = self.label_tokenize(demo_batch, entity_table).input_ids
+        demo_labels = self.label_tokenize(demo_batch, entity_table, split=split).input_ids
         demo_labels = torch.tensor(demo_labels, device=self.device)
         return demo_node_embeds, demo_labels
 
@@ -466,21 +734,57 @@ class Model(torch.nn.Module):
 
     def forward(
         self,
-        batch: HeteroData,
+        batch,
         entity_table: NodeType,
         context: bool = True,
         demo_info=None,
         inference: bool = False,
+        split: Optional[str] = None,
     ) -> Tensor:
         # 1) Encode graph → node embeddings
-        x_dict, batch_size = self.encode(batch, entity_table)
+        x_dict, batch_size = self.encode(batch, entity_table, split=split)
 
         # num_sampled_nodes_dict ->  the number of sampled nodes for each node type at each layer (hop)
         # e.g. {'user_friends': [0, 67636, 0], 'users': [512, 0, 2812], ...}
-        if not self.use_rt_encoder:
+        if not self.use_rt_encoder and not isinstance(batch, dict):
+            # GNN only works with HeteroData (has edge_index_dict)
             x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
 
-        node_embed = x_dict[entity_table][:batch_size]
+        # For RT batches, use precise seed node mapping if available
+        if hasattr(self, '_rt_seed_node_ids') and self._rt_seed_node_ids is not None and len(self._rt_seed_node_ids) > 0:
+            # Map seed node IDs to their positions in x_dict[entity_table]
+            # x_dict[entity_table] corresponds to n_id_dict[entity_table] from metadata
+            seed_node_ids = self._rt_seed_node_ids
+            if entity_table in x_dict:
+                # Get node IDs from metadata (stored in encode)
+                if hasattr(self, '_rt_n_id_dict') and entity_table in self._rt_n_id_dict:
+                    n_id_entity = self._rt_n_id_dict[entity_table]
+                    # Find positions of seed nodes in n_id_entity
+                    seed_positions = []
+                    for seed_id in seed_node_ids:
+                        matches = (n_id_entity == seed_id.item())
+                        if matches.any():
+                            pos = torch.where(matches)[0][0]
+                            seed_positions.append(pos.item())
+                    
+                    if len(seed_positions) == batch_size:
+                        # Use precise seed node positions
+                        seed_positions_tensor = torch.tensor(seed_positions, device=x_dict[entity_table].device)
+                        node_embed = x_dict[entity_table][seed_positions_tensor]
+                    else:
+                        # Fallback: use first batch_size nodes
+                        if not hasattr(self, '_encode_call_count') or self._encode_call_count == 0:
+                            print(f"[DEBUG] WARNING: Found {len(seed_positions)} seed positions but batch_size={batch_size}, using first batch_size nodes", flush=True)
+                        node_embed = x_dict[entity_table][:batch_size]
+                else:
+                    # No metadata available, use first batch_size
+                    node_embed = x_dict[entity_table][:batch_size]
+            else:
+                # Entity table not in x_dict, this shouldn't happen
+                raise KeyError(f"Entity table '{entity_table}' not found in x_dict. Available keys: {list(x_dict.keys())}")
+        else:
+            # Original path: use first batch_size nodes
+            node_embed = x_dict[entity_table][:batch_size]
         if self.model is None:
             # Pure GNN mode
             return self.head(node_embed)
@@ -494,13 +798,19 @@ class Model(torch.nn.Module):
         task_descs = self.tokenizer(task_desc, add_special_tokens=False)
         questions = self.tokenizer(question, add_special_tokens=False)
 
-        if not inference and not self.output_mlp:
-            labels = self.label_tokenize(batch, entity_table)
+        is_rt_batch = isinstance(batch, dict) and 'node_idxs' in batch
 
-        if context:
+        if not inference and not self.output_mlp:
+            # Extract labels for label prompting (works for both HeteroData and RT batches)
+            labels = self.label_tokenize(batch, entity_table, split=split)
+
+        # graph_prompt = node_embed[i].unsqueeze(0)
+        if context and not is_rt_batch:
             neighbors = self.recursive_sample(
                 batch, entity_table, torch.arange(batch_size), num_hops=1
             )
+        else:
+            neighbors = None
 
         # 3) In-context demos
         if self.num_demo > 0 and demo_info is not None:
@@ -580,7 +890,7 @@ class Model(torch.nn.Module):
 
             # Graph prompt: root + neighbors
             graph_prompt = node_embed[i].unsqueeze(0)
-            if context:
+            if context and neighbors is not None:
                 neighbor_embed = self.get_neighbor_embedding(
                     neighbors[entity_table][i], x_dict
                 )
@@ -612,8 +922,8 @@ class Model(torch.nn.Module):
                     [self.pad_embeds.repeat(pad_length, 1), batch_inputs_embeds[i]],
                     dim=0,
                 )
-                batch_attention_mask[i] = [0] * pad_length + batch_attention_mask[i]
-                if not inference and not self.output_mlp:
+            batch_attention_mask[i] = [0] * pad_length + batch_attention_mask[i]
+            if not inference and not self.output_mlp:
                     batch_label_input_ids[i] = (
                         [IGNORE_INDEX] * pad_length + batch_label_input_ids[i]
                     )
@@ -632,16 +942,7 @@ class Model(torch.nn.Module):
         if not inference and not self.output_mlp:
             label_input_ids = label_input_ids.to(device=self.model.device)
 
-        # 6) Truncate to MAX_CTX for safety
-        MAX_CTX = 2048
-        seq_len = inputs_embeds.size(1)
-        if seq_len > MAX_CTX:
-            inputs_embeds = inputs_embeds[:, -MAX_CTX:, :]
-            attention_mask = attention_mask[:, -MAX_CTX:]
-            if not inference and not self.output_mlp:
-                label_input_ids = label_input_ids[:, -MAX_CTX:]
-
-        # 7) Output-MLP mode (no generation, just hidden states → head)
+        # 6) Output-MLP mode (no generation, just hidden states → head)
         if self.output_mlp:
             with self.maybe_autocast():
                 outputs = self.model(
@@ -651,6 +952,8 @@ class Model(torch.nn.Module):
                     output_hidden_states=True,
                 )
             hidden = outputs.hidden_states[-1][..., -1, :]
+            # Convert to float32 for lm_head (RT encoder outputs bfloat16, but lm_head expects float32)
+            hidden = hidden.to(torch.float32)
             pred = self.lm_head(hidden).view(-1)
             return pred
 
@@ -667,68 +970,44 @@ class Model(torch.nn.Module):
                     )
                 return outputs.loss
 
-            # Binary: chunked focal loss to avoid OOM
-            B = inputs_embeds.size(0)
-            chunk_size = 16  # tune as needed
-            total_loss = None
-            total_tokens = 0
+            # Binary: focal loss
+            with self.maybe_autocast():
+                outputs = self.model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                )
 
-            for start in range(0, B, chunk_size):
-                end = min(B, start + chunk_size)
-                ie = inputs_embeds[start:end]
-                am = attention_mask[start:end]
-                li = label_input_ids[start:end]
+            # Shift so tokens < n predict token n
+            logits = outputs.logits[..., :-1, :]  # (B, L-1, C)
+            labels = label_input_ids[..., 1:]      # (B, L-1)
 
-                with self.maybe_autocast():
-                    outputs = self.model(
-                        inputs_embeds=ie,
-                        attention_mask=am,
-                        return_dict=True,
-                    )
-
-                # Shift so tokens < n predict token n
-                logits = outputs.logits[..., :-1, :]  # (b, L-1, C)
-                labels = li[..., 1:]                  # (b, L-1)
-
-                valid_mask = labels != IGNORE_INDEX
-                if not valid_mask.any():
-                    continue
-
-                labels_valid = labels[valid_mask]
-                logits_valid = logits[valid_mask]
-
-                probs = torch.nn.functional.softmax(logits_valid, dim=-1)
-                probs = probs.gather(
-                    dim=-1, index=labels_valid.unsqueeze(-1)
-                ).squeeze(-1)
-
-                focal_weight = (1 - probs).pow(self.gamma)
-                loss_chunk = -focal_weight * probs.log()
-
-                if self.alpha is not None:
-                    class_weights = torch.ones(
-                        self.model.vocab_size, device=self.model.device
-                    )
-                    class_weights[self.false_id] = self.alpha[0]
-                    class_weights[self.true_id] = self.alpha[1]
-                    alpha_t = class_weights.gather(dim=0, index=labels_valid)
-                    loss_chunk = alpha_t * loss_chunk
-
-                n_valid = labels_valid.numel()
-                loss_sum = loss_chunk.sum()
-
-                if total_loss is None:
-                    total_loss = loss_sum
-                else:
-                    total_loss = total_loss + loss_sum
-
-                total_tokens += n_valid
-
-            if total_tokens == 0:
+            valid_mask = labels != IGNORE_INDEX
+            if not valid_mask.any():
                 # No valid labels; return a dummy grad-bearing zero
                 return torch.zeros([], device=self.model.device, requires_grad=True)
 
-            return total_loss / total_tokens
+            labels_valid = labels[valid_mask]
+            logits_valid = logits[valid_mask]
+
+            probs = torch.nn.functional.softmax(logits_valid, dim=-1)
+            probs = probs.gather(
+                dim=-1, index=labels_valid.unsqueeze(-1)
+            ).squeeze(-1)
+
+            focal_weight = (1 - probs).pow(self.gamma)
+            loss = -focal_weight * probs.log()
+
+            if self.alpha is not None:
+                class_weights = torch.ones(
+                    self.model.vocab_size, device=self.model.device
+                )
+                class_weights[self.false_id] = self.alpha[0]
+                class_weights[self.true_id] = self.alpha[1]
+                alpha_t = class_weights.gather(dim=0, index=labels_valid)
+                loss = alpha_t * loss
+
+            return loss.mean()
 
         # 9) INFERENCE BRANCH (inference=True): generation + decoding
         with self.maybe_autocast():
@@ -794,11 +1073,12 @@ class Model(torch.nn.Module):
             x_dict, _ = self.encode(batch, entity_table)
         else:
             x_dict = self.encoder(batch.tf_dict)
-        # Add ID-awareness to the root node
-        x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
-        rel_time_dict = self.temporal_encoder(seed_time, batch.time_dict, batch.batch_dict)
-        for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
+            # Add ID-awareness to the root node
+            x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
+            rel_time_dict = self.temporal_encoder(seed_time, batch.time_dict, batch.batch_dict)
+            for node_type, rel_time in rel_time_dict.items():
+                if node_type in x_dict:
+                    x_dict[node_type] = x_dict[node_type] + rel_time
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
         if not self.use_rt_encoder:

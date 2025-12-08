@@ -3,6 +3,7 @@ import json
 import math
 import copy
 import os
+import time
 import wandb
 from pathlib import Path
 from typing import Dict
@@ -23,6 +24,7 @@ from relbench.modeling.graph import get_node_train_table_input, make_pkey_fkey_g
 from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
 from utils import task_info
+from rt_adapter import create_rt_loader
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -32,13 +34,70 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 os.environ['CURL_CA_BUNDLE'] = ''  # huggingface connection issue
 
 
+def get_batch_labels(batch, entity_table, device, task=None):
+    """
+    Unified label extractor for:
+      - HeteroData batches (original Rel-LLM)
+      - RT batches (dict from RelationalDataset)
+    """
+    # ---------- RT batch (dict from RT sampler) ----------
+    if isinstance(batch, dict):
+        # Preferred path: use RT's explicit class_value_idxs + is_targets
+        if "class_value_idxs" in batch and "is_targets" in batch:
+            is_targets = batch["is_targets"].bool()          # (B, S)
+            class_value_idxs = batch["class_value_idxs"]     # (B, S)
+
+            # Flatten targets across batch
+            y_all = class_value_idxs[is_targets]             # (N_targets,)
+
+            if y_all.numel() == 0:
+                raise RuntimeError("No targets found in RT batch (is_targets has no True).")
+
+            # true_batch_size = number of seed examples in this batch
+            true_bs = int(batch.get("true_batch_size", y_all.shape[0]))
+            y_all = y_all[:true_bs]                          # (true_bs,)
+
+            # Map to float labels depending on task type
+            if task is not None and task.task_type == TaskType.BINARY_CLASSIFICATION:
+                # For binary tasks, class_value_idxs should already be 0/1.
+                # Just clamp/sanitize to be safe.
+                y = torch.clamp(y_all, 0, 1).float()
+            else:
+                # Other task types: keep as-is (you can customize later)
+                y = y_all.float()
+
+            return y.to(device)
+
+        # Fallback: try a direct tensor field if someone stored labels there
+        for key in ["targets", "y", "labels"]:
+            if key in batch:
+                return batch[key].to(device).float()
+
+        raise KeyError(
+            f"Could not find labels in RT batch. "
+            f"Tried 'class_value_idxs' + 'is_targets' or ['targets', 'y', 'labels']. "
+            f"Available keys: {list(batch.keys())}"
+        )
+
+    # ---------- Original HeteroData path ----------
+    # batch[entity_table].y is already 0/1 or numeric
+    return batch[entity_table].y.to(device).float()
+
+
 @torch.no_grad()
-def test(loader: NeighborLoader, demo_info=None) -> np.ndarray:
+def test(loader, demo_info=None, split: str = "test") -> np.ndarray:
     model.eval()
     pred_list = []
     for test_batch in tqdm(loader):
-        test_batch = test_batch.to(device)
-        pred = model(test_batch, task.entity_table, demo_info, inference=True)
+        # Handle RT batch format (dict) vs HeteroData
+        if model.use_rt_sampler:
+            # RT batch is already a dict, move to device
+            for k, v in test_batch.items():
+                if isinstance(v, torch.Tensor):
+                    test_batch[k] = v.to(device)
+        else:
+            test_batch = test_batch.to(device)
+        pred = model(test_batch, task.entity_table, demo_info=demo_info, inference=True, split=split)
         if task.task_type == TaskType.REGRESSION:
             assert clamp_min is not None and clamp_max is not None
             pred = torch.clamp(pred, clamp_min, clamp_max)
@@ -75,7 +134,6 @@ if __name__ == '__main__':
     parser.add_argument("--rt_d_text", type=int, default=384, help="RT text embedding dimension")
     parser.add_argument("--rt_num_heads", type=int, default=8, help="Number of attention heads in RT")
     parser.add_argument("--rt_d_ff", type=int, default=1024, help="RT feed-forward dimension (pretrained uses 1024)")
-    parser.add_argument("--rt_max_seq_len", type=int, default=2048, help="Maximum sequence length for RT encoder (to prevent OOM, default 2048)")
     parser.add_argument("--rt_pretrained_path", type=str, default=None, help="Path to RT pretrained checkpoint")
 
     # LLMs
@@ -96,7 +154,7 @@ if __name__ == '__main__':
     parser.add_argument("--pretrain", action='store_true')
     parser.add_argument("--pretrain_epochs", type=int, default=200)
     parser.add_argument("--val_steps", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=256)  # default 512 for GNN
+    parser.add_argument("--batch_size", type=int, default=32)  # RT's default is 32; GNN can use larger (e.g., 256)
     parser.add_argument("--val_size", type=int, default=None)  # default 512 for GNN
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.0001)  # default 0.005 for GNN
@@ -142,17 +200,49 @@ if __name__ == '__main__':
 
     # 'num_neighbors' -> the number of neighbors sampled per node (e.g., [64, 32, 16]), 'num_sampled_nodes' -> the total number of nodes sampled per layer (hop)
     out_channels, loss_fn, tune_metric, higher_is_better, clamp_min, clamp_max = task_info(task)
-    loader_dict: Dict[str, NeighborLoader] = {}
-    for split in ["train", "val", "test"]:
-        table = task.get_table(split)
-        table_input = get_node_train_table_input(table=table, task=task)
-        entity_table = table_input.nodes[0]
-        bs = args.batch_size if (split == 'train' or args.val_size is None) else args.val_size
-        loader_dict[split] = NeighborLoader(data, num_neighbors=[int(args.num_neighbors / 2 ** i) for i in range(args.num_layers)], time_attr="time", input_nodes=table_input.nodes,
-                                            input_time=table_input.time, transform=table_input.transform, batch_size=bs, temporal_strategy=args.temporal_strategy,
-                                            shuffle=split == "train", num_workers=args.num_workers, persistent_workers=args.num_workers > 0, pin_memory=True)  # TODO: bidirectional
-    args.val_steps = min(args.val_steps, len(loader_dict['train']))
+    
+    # Determine entity table
+    table = task.get_table("train")
+    table_input = get_node_train_table_input(table=table, task=task)
+    entity_table = table_input.nodes[0]
     print('Entity table: ', entity_table)
+    
+    # RT encoder REQUIRES RT's sampler - NEVER use NeighborLoader when RT encoder is enabled
+    loader_dict: Dict = {}
+    rt_bridge_dict: Dict = {}
+    
+    if args.use_rt_encoder:
+        # REQUIRED: Use RT's sampler with BFS (NeighborLoader is NOT used)
+        print("Using RT's sampler with BFS traversal (RT encoder REQUIRES RT sampler)")
+        for split in ["train", "val", "test"]:
+            rt_batch_size = args.batch_size if (split == 'train' or args.val_size is None) else (args.val_size or args.batch_size)
+            loader, bridge = create_rt_loader(
+                task=task,
+                dataset_name=args.dataset,
+                entity_table=entity_table,
+                split=split,
+                batch_size=rt_batch_size,
+                seq_len=1024,  # RT's default seq_len
+                max_bfs_width=256,  # RT's default max_bfs_width
+                embedding_model="all-MiniLM-L12-v2",  # RT's default
+                d_text=args.rt_d_text,
+                num_workers=args.num_workers,
+                seed=args.seed,
+            )
+            loader_dict[split] = loader
+            rt_bridge_dict[split] = bridge
+        args.val_steps = min(args.val_steps, len(loader_dict['train']))
+    else:
+        # Use NeighborLoader (original Rel-LLM approach - GNN only, no RT encoder)
+        print("Using NeighborLoader (GNN path, RT encoder disabled)")
+        for split in ["train", "val", "test"]:
+            table = task.get_table(split)
+            table_input = get_node_train_table_input(table=table, task=task)
+            bs = args.batch_size if (split == 'train' or args.val_size is None) else args.val_size
+            loader_dict[split] = NeighborLoader(data, num_neighbors=[int(args.num_neighbors / 2 ** i) for i in range(args.num_layers)], time_attr="time", input_nodes=table_input.nodes,
+                                                input_time=table_input.time, transform=table_input.transform, batch_size=bs, temporal_strategy=args.temporal_strategy,
+                                                shuffle=split == "train", num_workers=args.num_workers, persistent_workers=args.num_workers > 0, pin_memory=True)  # TODO: bidirectional
+        args.val_steps = min(args.val_steps, len(loader_dict['train']))
 
     #############################################
     # model training
@@ -166,13 +256,20 @@ if __name__ == '__main__':
             'd_text': args.rt_d_text,
             'num_heads': args.rt_num_heads,
             'd_ff': args.rt_d_ff,
-            'max_seq_len': args.rt_max_seq_len,
             'pretrained_path': args.rt_pretrained_path,
         }
     
     model = Model(data, col_stats_dict, args.num_layers, channels=args.channels, out_channels=out_channels, aggr=args.aggr, dropout=args.dropout, model_type=args.model_type,
                   llm_frozen=args.llm_frozen, output_mlp=args.output_mlp, max_new_tokens=args.max_new_tokens, alpha=args.loss_class_weight, num_demo=args.num_demo,
                   dataset=args.dataset, task=task, use_rt_encoder=args.use_rt_encoder, rt_config=rt_config, text_embedder=text_embedder).to(device)
+    
+    # Pass RT bridges to model if using RT sampler
+    if args.use_rt_encoder and 'rt_bridge_dict' in locals():
+        model.rt_bridge_dict = rt_bridge_dict
+        model.use_rt_sampler = True
+    else:
+        model.use_rt_sampler = False
+    
     params = [p for _, p in model.named_parameters() if p.requires_grad]
     if args.wd != 0:  # weight decay should not be applied to bias terms and LayerNorm parameters
         optimizer = torch.optim.AdamW([{'params': [p for n, p in model.named_parameters() if "bias" not in n and "LayerNorm" not in n], 'weight_decay': args.wd},
@@ -192,16 +289,27 @@ if __name__ == '__main__':
             run = wandb.init(project='rel-LLM-zero', name=f'{args.dataset}_{args.task}', id=f"pretrain_run_{args.dataset}_{args.task}", resume="allow")
         pretrain_steps = 0
         best_val_metric = -math.inf if higher_is_better else math.inf
+        pretrain_batch_start_time = time.time()  # Initialize batch timing for pretrain
         for epoch in range(1, args.pretrain_epochs + 1):
             loss_accum = count_accum = 0
             tq = tqdm(loader_dict["train"], total=len(loader_dict["train"]))
-            for batch in tq:
+            for batch_idx, batch in enumerate(tq):
                 try:
                     model.train()
-                    batch = batch.to(device)
-                    nums_samples = batch[entity_table].y.size(0)
+                    # Handle RT batch format (dict) vs HeteroData
+                    if model.use_rt_sampler:
+                        # RT batch is already a dict, move to device
+                        for k, v in batch.items():
+                            if isinstance(v, torch.Tensor):
+                                batch[k] = v.to(device)
+                        nums_samples = batch.get('true_batch_size', batch['node_idxs'].shape[0])
+                        split = "train"
+                    else:
+                        batch = batch.to(device)
+                        nums_samples = batch[entity_table].y.size(0)
+                        split = None
                     optimizer.zero_grad()
-                    loss = model.pretrain(batch, task.entity_table)
+                    loss = model.pretrain(batch, task.entity_table, split=split)
                     loss.backward()
                     optimizer.step()
                 except torch.OutOfMemoryError:
@@ -212,16 +320,39 @@ if __name__ == '__main__':
                 loss_accum += loss.detach().item() * nums_samples
                 count_accum += nums_samples
                 train_loss = loss_accum / count_accum
-                summary = {'loss': train_loss, 'lr': optimizer.param_groups[-1]['lr']}
+                
+                # Time logging
+                batch_end_time = time.time()
+                if pretrain_steps == 1:
+                    pretrain_batch_start_time = batch_end_time
+                batch_time = batch_end_time - pretrain_batch_start_time if pretrain_steps > 1 else 0.0
+                steps_per_sec = 1.0 / batch_time if batch_time > 0 else 0.0
+                pretrain_batch_start_time = batch_end_time
+                
+                summary = {
+                    'loss': train_loss, 
+                    'lr': optimizer.param_groups[-1]['lr'],
+                    'batch_time': batch_time,
+                    'steps_per_sec': steps_per_sec
+                }
                 if not args.debug:
                     for k, v in summary.items():
                         run.log({f'Pretrain/{k}': v}, step=pretrain_steps)  # Steps must be monotonically increasing
-                tq.set_description(f'[Pretrain] Epoch/Step: {epoch:02d}/{pretrain_steps} | Train loss: {train_loss}')
+                tq.set_description(f'[Pretrain] Epoch/Step: {epoch:02d}/{pretrain_steps} | Train loss: {train_loss:.4f} | {steps_per_sec:.2f} steps/s')
 
                 # zero-shot / few-shot evaluation
                 if pretrain_steps % args.val_steps == 0:
-                    demo = model.get_demo_info(next(iter(loader_dict["train"])).to(device), task.entity_table) if args.num_demo > 0 else None
-                    val_pred = test(loader_dict["val"], demo)
+                    # Get demo info
+                    train_batch = next(iter(loader_dict["train"]))
+                    if model.use_rt_sampler:
+                        for k, v in train_batch.items():
+                            if isinstance(v, torch.Tensor):
+                                train_batch[k] = v.to(device)
+                    else:
+                        train_batch = train_batch.to(device)
+                    demo = model.get_demo_info(train_batch, task.entity_table, split="train") if args.num_demo > 0 else None
+                    
+                    val_pred = test(loader_dict["val"], demo, split="val")
                     val_metrics = task.evaluate(val_pred, task.get_table("val"))
                     if not args.debug:
                         for k, v in val_metrics.items():
@@ -229,7 +360,7 @@ if __name__ == '__main__':
 
                     if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (not higher_is_better and val_metrics[tune_metric] <= best_val_metric):
                         best_val_metric = val_metrics[tune_metric]
-                        test_pred = test(loader_dict["test"], demo)
+                        test_pred = test(loader_dict["test"], demo, split="test")
                         test_metrics = task.evaluate(test_pred)
                         if not args.debug:
                             for k, v in test_metrics.items():
@@ -245,23 +376,59 @@ if __name__ == '__main__':
     if not args.debug:
         if args.pretrain:
             run.finish()
-        run = wandb.init(entity="9race-stanford", project='rel-LLM', name=f'{args.dataset}_{args.task}', id=f"finetune_run_{args.dataset}_{args.task}", resume="allow")
+        # Create a new run with timestamp to avoid resuming old runs
+        timestamp = int(time.time())
+        run = wandb.init(entity="9race-stanford", project='rel-LLM', name=f'{args.dataset}_{args.task}', id=f"finetune_run_{args.dataset}_{args.task}_{timestamp}", resume="never")
     if state_dict is not None: model.load_state_dict(state_dict)  # load pretrained weights
     best_val_metric = -math.inf if higher_is_better else math.inf
+    batch_start_time = time.time()  # Initialize batch timing for fine-tuning
+    print(f"[DEBUG] Starting training loop, total batches: {len(loader_dict['train'])}")
     for epoch in range(1, args.epochs + 1):
         loss_accum = count_accum = 0
+        print(f"[DEBUG] Epoch {epoch}, creating DataLoader iterator...")
         tq = tqdm(loader_dict["train"], total=len(loader_dict["train"]))
-        for batch in tq:
+        print(f"[DEBUG] Starting to iterate over batches...")
+        for batch_idx, batch in enumerate(tq):
+            if batch_idx == 0:
+                print(f"[DEBUG] Got first batch from DataLoader!")
             model.train()
-            batch = batch.to(device)
-            nums_samples = batch[entity_table].y.size(0)
-            optimizer.zero_grad()  # continued learning rate
-            if args.model_type == 'gnn' or args.output_mlp:
-                output_pred = model(batch, task.entity_table)
-                output_pred = output_pred.view(-1) if len(output_pred.size()) > 1 and output_pred.size(1) == 1 else output_pred
-                loss = loss_fn(output_pred.float(), batch[entity_table].y.float())
+            # Handle RT batch format (dict) vs HeteroData
+            if model.use_rt_sampler:
+                # IMPORTANT: keep RT batch on CPU; Model.encode will handle device moves
+                if steps == 0:
+                    print(f"[DEBUG] First batch received (RT), staying on CPU before encode...")
+                nums_samples = batch.get('true_batch_size', batch['node_idxs'].shape[0])
+                split = "train"
+                if steps == 0:
+                    print(f"[DEBUG] RT batch info: batch_size={nums_samples}, node_idxs shape={batch['node_idxs'].shape}")
             else:
-                loss = model(batch, task.entity_table)
+                batch = batch.to(device)
+                nums_samples = batch[entity_table].y.size(0)
+                split = None
+            optimizer.zero_grad()  # continued learning rate
+            if steps == 0:
+                print(f"[DEBUG] Starting forward pass...")
+            if args.model_type == 'gnn' or args.output_mlp:
+                output_pred = model(batch, task.entity_table, split=split)
+                output_pred = (
+                    output_pred.view(-1)
+                    if len(output_pred.size()) > 1 and output_pred.size(1) == 1
+                    else output_pred
+                )
+
+                # 🔑 Get labels correctly for RT vs GNN
+                y = get_batch_labels(
+                    batch,
+                    entity_table=entity_table,
+                    device=output_pred.device,
+                    task=task,
+                )
+
+                loss = loss_fn(output_pred.float(), y)
+            else:
+                loss = model(batch, task.entity_table, split=split)
+            if steps == 0:
+                print(f"[DEBUG] Forward pass complete, loss={loss.item():.4f}")
             loss.backward()
             optimizer.step()
 
@@ -269,15 +436,29 @@ if __name__ == '__main__':
             loss_accum += loss.detach().item() * nums_samples
             count_accum += nums_samples
             train_loss = loss_accum / count_accum
-            summary = {'loss': train_loss, 'lr': optimizer.param_groups[-1]['lr']}
+            
+            # Time logging
+            batch_end_time = time.time()
+            if steps == 1:
+                batch_start_time = batch_end_time
+            batch_time = batch_end_time - batch_start_time if steps > 1 else 0.0
+            steps_per_sec = 1.0 / batch_time if batch_time > 0 else 0.0
+            batch_start_time = batch_end_time
+            
+            summary = {
+                'loss': train_loss, 
+                'lr': optimizer.param_groups[-1]['lr'],
+                'batch_time': batch_time,
+                'steps_per_sec': steps_per_sec
+            }
             if not args.debug:
                 for k, v in summary.items():
                     run.log({f'train/{k}': v}, step=steps)
-            tq.set_description(f'[Train] Epoch/Step: {epoch:02d}/{steps} | Train loss: {train_loss:3f}')
+            tq.set_description(f'[Train] Epoch/Step: {epoch:02d}/{steps} | Train loss: {train_loss:.4f} | {steps_per_sec:.2f} steps/s')
             if steps % args.val_steps == 0:
-                val_pred = test(loader_dict["val"])
+                val_pred = test(loader_dict["val"], split="val")
                 val_metrics = task.evaluate(val_pred, task.get_table("val"))
-                test_pred = test(loader_dict["test"])
+                test_pred = test(loader_dict["test"], split="test")
                 test_metrics = task.evaluate(test_pred)
                 if not args.debug:
                     for k, v in val_metrics.items():
@@ -294,9 +475,9 @@ if __name__ == '__main__':
     # evaluation
     #############################################
     model.load_state_dict(state_dict)
-    val_pred = test(loader_dict["val"])
+    val_pred = test(loader_dict["val"], split="val")
     val_metrics = task.evaluate(val_pred, task.get_table("val"))
-    test_pred = test(loader_dict["test"])
+    test_pred = test(loader_dict["test"], split="test")
     test_metrics = task.evaluate(test_pred)
     print(f"Best Val metrics: {val_metrics}")  # nuance due to sampling
     print(f"Best test metrics: {test_metrics}")

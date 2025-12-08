@@ -7,6 +7,7 @@ import sys
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from functools import partial
 import torch
 from torch import Tensor
 from torch.nn import Module
@@ -16,12 +17,33 @@ from torch_geometric.typing import NodeType
 import torch_frame
 from torch_frame import stype
 import numpy as np
+import json
 
 # Add relational-transformer to path
 rt_path = Path(__file__).parent / "relational-transformer"
 if rt_path.exists():
     sys.path.insert(0, str(rt_path))
-    from rt.model import RelationalTransformer, _make_block_mask
+    # RT requires maturin_import_hook for Rust modules
+    # Try to install it, but continue if not available (might work if Rust module is pre-built)
+    try:
+        import maturin_import_hook
+        from maturin_import_hook.settings import MaturinSettings
+        maturin_import_hook.install(settings=MaturinSettings(release=True, uv=True))
+    except ImportError:
+        # maturin_import_hook not installed - might still work if Rust module is already built
+        pass
+    
+    try:
+        from rt.model import RelationalTransformer, _make_block_mask
+        from rt.data import RelationalDataset
+        from torch.utils.data import DataLoader
+    except ImportError as e:
+        raise ImportError(
+            f"Failed to import RT modules. This usually means:\n"
+            f"1. maturin_import_hook is not installed: pip install maturin-import-hook\n"
+            f"2. Rust sampler is not built: cd relational-transformer/rustler && maturin develop --release\n"
+            f"Original error: {e}"
+        )
 else:
     raise ImportError(f"relational-transformer not found at {rt_path}")
 
@@ -41,160 +63,115 @@ class RTEncoderOnly(Module):
     def __init__(self, rt_model: RelationalTransformer):
         super().__init__()
         self.rt_model = rt_model
-        # 1) Don’t store KV cache during training
+        # 1) Don't store KV cache during training
 
-
+        
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
         """
         Forward pass that returns cell embeddings only.
-
-        batch keys (before padding):
-            node_idxs:       (B, S)
-            f2p_nbr_idxs:    (B, S, 5)
-            col_name_idxs:   (B, S)
-            table_name_idxs: (B, S)
-            sem_types:       (B, S)
-            is_padding:      (B, S)
-            masks:           (B, S)
-            number_values:   (B, S, 1)
-            text_values:     (B, S, d_text)
-            datetime_values: (B, S, 1)
-            boolean_values:  (B, S, 1)
-            col_name_values: (B, S, d_text)
-
-        Returns:
-            x: (B, S, d_model) encoder output (unpadded)
+        Returns: (B, S, d_model) cell embeddings
         """
+        if not hasattr(self, '_rt_forward_count'):
+            self._rt_forward_count = 0
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RTEncoderOnly.forward() started")
+        
         node_idxs = batch["node_idxs"]
         f2p_nbr_idxs = batch["f2p_nbr_idxs"]
         col_name_idxs = batch["col_name_idxs"]
         table_name_idxs = batch["table_name_idxs"]
         is_padding = batch["is_padding"]
-
         batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
+        
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: batch_size={batch_size}, seq_len={seq_len}, device={device}")
 
-        # Handle empty sequences
-        if seq_len == 0:
-            d_model = self.rt_model.d_model
-            return torch.zeros(batch_size, 0, d_model, device=device)
-
-        # ---- PAD SEQUENCE TO MULTIPLE OF 128 FOR FLEX_ATTENTION ----
+        # ---- PAD SEQUENCE TO MULTIPLE OF 128 FOR FLEX_ATTENTION FIRST ----
+        # Must pad BEFORE building attention masks and block masks
         original_seq_len = seq_len
         needs_padding = (seq_len > 0) and (seq_len % 128 != 0)
 
         if needs_padding:
             padded_seq_len = ((seq_len + 127) // 128) * 128
             pad_size = padded_seq_len - seq_len
-
-            padded_is_padding = F.pad(is_padding, (0, pad_size), value=True)
-
+            
+            # Pad batch values for encoding
             padded_batch = {}
             for k, v in batch.items():
                 if k == "is_padding":
-                    padded_batch[k] = padded_is_padding
-                elif k in ["node_idxs", "col_name_idxs", "table_name_idxs",
-                           "sem_types", "masks"]:
-                    # (B, S)
-                    if v.dim() == 2:
-                        padded_batch[k] = F.pad(v, (0, pad_size), value=0)
-                    else:
-                        padded_batch[k] = v
-                elif k == "f2p_nbr_idxs":
-                    # (B, S, 5)  pad S dimension
-                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=-1)
-                elif k in ["number_values", "datetime_values", "boolean_values"]:
-                    # (B, S, 1)
-                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=0.0)
-                elif k in ["text_values", "col_name_values"]:
-                    # (B, S, d_text)
-                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=0.0)
+                    padded_batch[k] = F.pad(v, (0, pad_size), value=True)
+                elif v.dim() == 2 and v.shape[1] == original_seq_len:
+                    padded_batch[k] = F.pad(v, (0, pad_size), value=0)
+                elif v.dim() == 3 and v.shape[1] == original_seq_len:
+                    padded_batch[k] = F.pad(v, (0, 0, 0, pad_size), value=0.0 if k.endswith("_values") else -1)
                 else:
-                    # any other tensors untouched
                     padded_batch[k] = v
-
-            # Sanity checks: everything that depends on S should now be padded_seq_len
-            for k in ["number_values", "text_values", "datetime_values",
-                      "boolean_values", "col_name_values"]:
-                if k in padded_batch:
-                    v = padded_batch[k]
-                    if v.dim() >= 2:
-                        if v.shape[1] != padded_seq_len:
-                            raise RuntimeError(
-                                f"Padding mismatch for {k}: expected S={padded_seq_len}, "
-                                f"got {v.shape[1]}, shape={v.shape}"
-                            )
-
-            for k in ["is_padding", "sem_types", "masks", "node_idxs",
-                      "col_name_idxs", "table_name_idxs"]:
-                if k in padded_batch:
-                    v = padded_batch[k]
-                    if v.dim() >= 2 and v.shape[1] != padded_seq_len:
-                        raise RuntimeError(
-                            f"Padding mismatch for {k}: expected S={padded_seq_len}, "
-                            f"got {v.shape[1]}, shape={v.shape}"
-                        )
-
-            # Update references
+            
+            # Update batch and seq_len
             batch = padded_batch
             seq_len = padded_seq_len
-            is_padding = padded_is_padding
             node_idxs = batch["node_idxs"]
             f2p_nbr_idxs = batch["f2p_nbr_idxs"]
             col_name_idxs = batch["col_name_idxs"]
             table_name_idxs = batch["table_name_idxs"]
+            is_padding = batch["is_padding"]  # Use the padded is_padding
 
-        # ---- ATTENTION MASKS (now using padded seq_len if we padded) ----
+        # ---- BUILD ATTENTION MASKS WITH PADDED SEQUENCE LENGTH ----
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: Building attention masks...")
+        # Padding mask for attention pairs (allow only non-pad -> non-pad)
         pad = (~is_padding[:, :, None]) & (~is_padding[:, None, :])  # (B, S, S)
-
-        same_node = node_idxs[:, :, None] == node_idxs[:, None, :]   # (B, S, S)
-
-        kv_in_f2p = (
-            node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]
-        ).any(-1)                                                    # (B, S, S)
-
-        q_in_f2p = (
-            node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]
-        ).any(-1)                                                    # (B, S, S)
-
-        same_col_table = (
-            (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) &
-            (table_name_idxs[:, :, None] == table_name_idxs[:, None, :])
-        )                                                            # (B, S, S)
-
+        
+        # cells in the same node
+        same_node = node_idxs[:, :, None] == node_idxs[:, None, :]  # (B, S, S)
+        
+        # kv index is among q's foreign -> primary neighbors
+        kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(
+            -1
+        )  # (B, S, S)
+        
+        # q index is among kv's primary -> foreign neighbors (reverse relation)
+        q_in_f2p = (node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]).any(
+            -1
+        )  # (B, S, S)
+        
+        # Same column AND same table
+        same_col_table = (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) & (
+            table_name_idxs[:, :, None] == table_name_idxs[:, None, :]
+        )  # (B, S, S)
+        
+        # Final boolean masks (apply padding once here)
         attn_masks = {
             "feat": (same_node | kv_in_f2p) & pad,
-            "nbr":  q_in_f2p & pad,
-            "col":  same_col_table & pad,
+            "nbr": q_in_f2p & pad,
+            "col": same_col_table & pad,
             "full": pad,
         }
-
-        for k in attn_masks:
-            attn_masks[k] = attn_masks[k].contiguous()
-
-        # ---- BLOCK MASKS (flex-attention) ----
-        from functools import partial
+        
+        # Make them contiguous for better kernel performance
+        for l in attn_masks:
+            attn_masks[l] = attn_masks[l].contiguous()
+        
+        # ---- BUILD BLOCK MASKS WITH PADDED SEQUENCE LENGTH ----
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: Building block masks...")
+        # Convert to block masks (seq_len must match the actual sequence length going into blocks)
         make_block_mask = partial(
             _make_block_mask,
             batch_size=batch_size,
-            seq_len=seq_len,   # NOTE: padded seq_len if needs_padding
+            seq_len=seq_len,  # Use padded seq_len, not original_seq_len
             device=device,
         )
-        block_masks = {k: make_block_mask(m) for k, m in attn_masks.items()}
+        block_masks = {
+            l: make_block_mask(attn_mask) for l, attn_mask in attn_masks.items()
+        }
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: Block masks built")
 
-        # ---- ENCODING (same as RT) ----
         expected_S = seq_len
-        if batch["sem_types"].shape[1] != expected_S:
-            raise RuntimeError(
-                f"sem_types length mismatch: expected {expected_S}, "
-                f"got {batch['sem_types'].shape[1]}"
-            )
-        if batch["masks"].shape[1] != expected_S:
-            raise RuntimeError(
-                f"masks length mismatch: expected {expected_S}, "
-                f"got {batch['masks'].shape[1]}"
-            )
 
+        # ---- ENCODE CELL VALUES ----
         x = 0
         col_name_values = batch["col_name_values"]
         if col_name_values.shape[1] != expected_S:
@@ -208,7 +185,7 @@ class RTEncoderOnly(Module):
                 self.rt_model.enc_dict["col_name"](col_name_values)
             ) * (~is_padding)[..., None]
         )
-
+        
         for i, t in enumerate(["number", "text", "datetime", "boolean"]):
             value_key = t + "_values"
             if value_key not in batch:
@@ -228,13 +205,24 @@ class RTEncoderOnly(Module):
                 self.rt_model.mask_embs[t]
                 * ((batch["sem_types"] == i) & batch["masks"] & ~is_padding)[..., None]
             )
-
+        
         # ---- RELATIONAL BLOCKS ----
-        for block in self.rt_model.blocks:
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: Running {len(self.rt_model.blocks)} relational blocks...")
+        for i, block in enumerate(self.rt_model.blocks):
+            if self._rt_forward_count == 0 and i == 0:
+                print(f"[DEBUG] RT encoder: Running block {i+1}/{len(self.rt_model.blocks)}...")
             x = block(x, block_masks)
-
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: All blocks complete")
+        
         # ---- FINAL NORM ----
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: Applying final norm...")
         x = self.rt_model.norm_out(x)
+        if self._rt_forward_count == 0:
+            print(f"[DEBUG] RT encoder: Forward pass complete, output shape={x.shape}")
+        self._rt_forward_count += 1
 
         # ---- UNPAD BACK TO ORIGINAL SEQ_LEN ----
         if needs_padding:
@@ -286,7 +274,7 @@ class HeteroDataToRTBatch:
     def _get_table_idx(self, table_name: str) -> int:
         """Get table name index."""
         return self.table_name_to_idx.get(table_name, 0)
-        
+    
     def _get_text_embedding(self, text_value) -> np.ndarray:
         """Get text embedding for a cell value. Always returns numpy array of length self.d_text."""
         if self.text_embedder is not None:
@@ -400,13 +388,13 @@ class HeteroDataToRTBatch:
     ) -> Dict[str, Tensor]:
         """
         Convert HeteroData batch to RT batch format.
-
+        
         * node_idxs are LOCAL per table: 0 .. num_nodes(table)-1
         * all *_values have shape (1, S, ...)
         """
         self._build_mappings(batch)
         device = batch[entity_table].seed_time.device
-
+        
         all_cells: List[dict] = []
         node_idxs_list: List[int] = []
         col_name_idxs_list: List[int] = []
@@ -418,14 +406,14 @@ class HeteroDataToRTBatch:
             tf = batch.tf_dict[node_type]
             num_nodes = len(tf)
             table_idx = self._get_table_idx(node_type)
-
+            
             for node_idx_in_table in range(num_nodes):
                 # node_idx is LOCAL to this table
                 node_idx = node_idx_in_table
-
+                
                 for stype_name, feat in tf.feat_dict.items():
                     col_names = tf.col_names_dict.get(stype_name, [])
-
+                    
                     if stype_name == stype.numerical:
                         if isinstance(feat, Tensor):
                             for col_j, col_name in enumerate(col_names):
@@ -441,7 +429,7 @@ class HeteroDataToRTBatch:
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
                                 table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(0)
-
+                    
                     elif stype_name == stype.categorical:
                         if isinstance(feat, Tensor):
                             for col_j, col_name in enumerate(col_names):
@@ -457,7 +445,7 @@ class HeteroDataToRTBatch:
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
                                 table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(0)
-
+                    
                     elif stype_name == stype.text_embedded:
                         if isinstance(feat, torch_frame.data.MultiEmbeddingTensor):
                             offset = feat.offset
@@ -465,7 +453,7 @@ class HeteroDataToRTBatch:
                                 start_idx = offset[node_idx_in_table * len(col_names) + col_j]
                                 end_idx = offset[node_idx_in_table * len(col_names) + col_j + 1]
                                 value = feat.values[start_idx:end_idx].cpu().numpy()
-
+                                
                                 all_cells.append({
                                     "value": value,
                                     "sem_type": 1,  # text
@@ -477,7 +465,7 @@ class HeteroDataToRTBatch:
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
                                 table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(1)
-
+                    
                     elif stype_name == stype.timestamp:
                         # Timestamp -> scalar datetime
                         if isinstance(feat, Tensor):
@@ -503,32 +491,16 @@ class HeteroDataToRTBatch:
                                 col_name_idxs_list.append(self._get_col_idx(col_name, node_type))
                                 table_name_idxs_list.append(table_idx)
                                 sem_types_list.append(2)
-
-        # ---- Handle empty graph ----
+                
         seq_len = len(all_cells)
-        if seq_len == 0:
-            return {
-                "node_idxs":       torch.zeros(1, 0, dtype=torch.long, device=device),
-                "col_name_idxs":   torch.zeros(1, 0, dtype=torch.long, device=device),
-                "table_name_idxs": torch.zeros(1, 0, dtype=torch.long, device=device),
-                "sem_types":       torch.zeros(1, 0, dtype=torch.long, device=device),
-                "is_padding":      torch.ones(1, 0, dtype=torch.bool, device=device),
-                "masks":           torch.zeros(1, 0, dtype=torch.bool, device=device),
-                "f2p_nbr_idxs":    torch.full((1, 0, 5), -1, dtype=torch.long, device=device),
-                "number_values":   torch.zeros(1, 0, 1, device=device),
-                "text_values":     torch.zeros(1, 0, self.d_text, device=device),
-                "datetime_values": torch.zeros(1, 0, 1, device=device),
-                "boolean_values":  torch.zeros(1, 0, 1, device=device),
-                "col_name_values": torch.zeros(1, 0, self.d_text, device=device),
-            }
-
+        
         # ---- Second pass: build aligned value arrays (length = seq_len) ----
         number_rows:   List[np.ndarray] = []
         text_rows:     List[np.ndarray] = []
         datetime_rows: List[np.ndarray] = []
         boolean_rows:  List[np.ndarray] = []
         colname_rows:  List[np.ndarray] = []
-
+        
         for cell in all_cells:
             colname_rows.append(self._get_text_embedding(cell["col_name"]))  # always filled
 
@@ -568,7 +540,7 @@ class HeteroDataToRTBatch:
                 datetime_rows.append(np.zeros(1, dtype=np.float32))
                 boolean_rows.append(np.array([float(v > 0)], dtype=np.float32))
 
-            else:
+        else:
                 # Fallback: everything zero
                 number_rows.append(np.zeros(1, dtype=np.float32))
                 text_rows.append(np.zeros(self.d_text, dtype=np.float32))
@@ -595,12 +567,12 @@ class HeteroDataToRTBatch:
             "boolean_values":  torch.tensor(boolean_arr,  device=device, dtype=torch.float32).unsqueeze(0),
             "col_name_values": torch.tensor(colname_arr,  device=device, dtype=torch.float32).unsqueeze(0),
         }
-
+        
         # f2p_nbr_idxs uses LOCAL node indices (0..num_nodes-1) per table
         rt_batch["f2p_nbr_idxs"] = self._compute_f2p_neighbors(
             batch, node_idxs_list, table_name_idxs_list
         )
-
+        
         return rt_batch
 
 
@@ -685,3 +657,322 @@ def aggregate_cells_to_nodes(
     return x_dict
 
 
+def aggregate_cells_to_nodes_from_rt_batch(
+    cell_embeds: Tensor,  # (B, S, d_model)
+    rt_batch: Dict[str, Tensor],
+    table_idx_to_node_type: Dict[int, str],
+    aggr: str = "sum"
+) -> Dict[str, Tensor]:
+    """
+    Aggregate cell embeddings to node embeddings from RT batch format.
+    Works without HeteroData - uses RT's table indices.
+    
+    Args:
+        cell_embeds: (B, S, d_model) cell embeddings from RT encoder
+        rt_batch: RT batch dict with node_idxs, table_name_idxs
+        table_idx_to_node_type: Mapping from RT table index to node type name
+        aggr: Aggregation method ("sum", "mean", "max")
+        
+    Returns:
+        x_dict: Dict mapping node_type -> (num_nodes, d_model) embeddings
+    """
+    device = cell_embeds.device
+    B, S, d_model = cell_embeds.shape
+    
+    # Flatten batch dimension: (B, S, d_model) -> (B*S, d_model)
+    cell_embeds_flat = cell_embeds.view(-1, d_model)  # (B*S, d_model)
+
+    node_idxs = rt_batch['node_idxs'].flatten()  # (B*S,) - RT's global node indices
+    table_name_idxs = rt_batch['table_name_idxs'].flatten()  # (B*S,)
+
+    x_dict: Dict[str, Tensor] = {}
+
+    # Group by table
+    for table_idx_tensor in torch.unique(table_name_idxs):
+        table_idx = int(table_idx_tensor.item())
+        if table_idx not in table_idx_to_node_type:
+            continue
+        
+        node_type = table_idx_to_node_type[table_idx]
+        mask = (table_name_idxs == table_idx)
+        
+        if not mask.any():
+            continue
+        
+        table_node_idxs = node_idxs[mask]  # Global node indices
+        table_cell_embeds = cell_embeds_flat[mask]  # (S_table, d_model)
+
+        # Get unique nodes and their local indices
+        unique_nodes, inverse_indices = torch.unique(table_node_idxs, return_inverse=True)
+        num_nodes = len(unique_nodes)
+
+        # Initialize node embeddings
+        node_embeds = torch.zeros(num_nodes, d_model, device=device)
+
+        if aggr in ("sum", "mean"):
+            counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
+            
+            for emb, local_idx in zip(table_cell_embeds, inverse_indices):
+                node_embeds[local_idx] += emb
+                counts[local_idx] += 1
+
+            if aggr == "mean":
+                mask_nonzero = counts > 0
+                node_embeds[mask_nonzero] = (
+                    node_embeds[mask_nonzero] / counts[mask_nonzero].unsqueeze(-1)
+                )
+
+        elif aggr == "max":
+            counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
+            node_embeds[:] = -1e9
+            for emb, local_idx in zip(table_cell_embeds, inverse_indices):
+                node_embeds[local_idx] = torch.maximum(node_embeds[local_idx], emb)
+                counts[local_idx] += 1
+            mask_zero = counts == 0
+            node_embeds[mask_zero] = 0.0
+        else:
+            raise ValueError(f"Unknown aggregation method: {aggr}")
+
+        x_dict[node_type] = node_embeds
+
+    return x_dict
+
+
+# ============================================================================
+# RT SAMPLER BRIDGE - New components for using RT's sampler directly
+# ============================================================================
+
+
+class RTBatchToRelLLMFormat:
+    """
+    Bridge that converts RT batch format + metadata → Rel-LLM format.
+    
+    RT's sampler returns batches in RT format, but Rel-LLM needs:
+    - seed_time: timestamps for seed nodes
+    - n_id: global node IDs  
+    - time_dict: timestamps for all nodes
+    - batch_dict: mapping nodes to seed nodes
+    """
+    def __init__(self, task, entity_table: str, dataset_name: str):
+        self.task = task
+        self.entity_table = entity_table
+        self.dataset_name = dataset_name
+        
+        # RT uses task table name (e.g., "user-churn") while Rel-LLM uses entity table name (e.g., "customer")
+        # Store the RT task table name that corresponds to the entity_table
+        self.rt_task_table_name = task.name  # e.g., "user-churn" for user-churn task
+        
+        # Load RT's table_info to map node indices and table names
+        home = os.environ.get("HOME", ".")
+        table_info_path = os.path.join(home, "scratch", "pre", dataset_name, "table_info.json")
+        if os.path.exists(table_info_path):
+            with open(table_info_path) as f:
+                self.table_info = json.load(f)
+        else:
+            self.table_info = {}
+        
+        # Build mapping from RT table index → table name (node type)
+        # RT's table_info keys are "table_name:TableType" (e.g., "users:Db", "users:Train")
+        # We extract table names and order by node_idx_offset to get table indices
+        table_entries = []
+        for key, info in self.table_info.items():
+            table_name = key.split(':')[0]  # Extract table name before ':'
+            table_entries.append((table_name, info['node_idx_offset'], key))
+        
+        # Sort by node_idx_offset to get table index order
+        table_entries.sort(key=lambda x: x[1])
+        
+        # Build mapping: table_idx → table_name (node_type)
+        self.table_idx_to_node_type = {}
+        self.node_type_to_table_idx = {}
+        for table_idx, (table_name, _, _) in enumerate(table_entries):
+            self.table_idx_to_node_type[table_idx] = table_name
+            if table_name not in self.node_type_to_table_idx:
+                self.node_type_to_table_idx[table_name] = table_idx
+        
+        # Build reverse mapping: RT task table name → Rel-LLM entity table name
+        # For the entity table, use the RT task table name
+        self.rt_to_relllm_table_map = {self.rt_task_table_name: self.entity_table}
+    
+    def extract_seed_nodes(self, rt_batch: Dict[str, Tensor]) -> Tuple[List[Tensor], int]:
+        """
+        Extract seed node information from RT batch.
+        
+        Returns:
+            seed_cell_indices_list: List of (num_seeds_i,) tensors, one per batch item
+            batch_size: total number of seed nodes across all batch items
+        """
+        # RT batch has is_task_nodes: (B, S) marking seed nodes
+        is_task_nodes = rt_batch['is_task_nodes']  # (B, S)
+        B, S = is_task_nodes.shape
+        
+        node_idxs = rt_batch['node_idxs']  # (B, S)
+        table_name_idxs = rt_batch['table_name_idxs']  # (B, S)
+        
+        # Extract seed nodes for each batch item
+        seed_cell_indices_list = []
+        total_seed_nodes = 0
+        
+        for b in range(B):
+            seed_mask = is_task_nodes[b]  # (S,)
+            seed_cell_indices = torch.where(seed_mask)[0]  # Indices of seed cells for this batch item
+            
+            # Get unique seed nodes (multiple cells per node)
+            batch_node_idxs = node_idxs[b]  # (S,)
+            batch_table_name_idxs = table_name_idxs[b]  # (S,)
+            
+            seed_nodes = set()
+            for cell_idx in seed_cell_indices:
+                cell_idx_int = int(cell_idx.item())
+                table_idx = int(batch_table_name_idxs[cell_idx_int].item())
+                node_idx = int(batch_node_idxs[cell_idx_int].item())
+                seed_nodes.add((table_idx, node_idx))
+            
+            seed_cell_indices_list.append(seed_cell_indices)
+            total_seed_nodes += len(seed_nodes)
+        
+        return seed_cell_indices_list, total_seed_nodes
+    
+    def extract_seed_time(self, split: str) -> Tensor:
+        """
+        Extract seed_time from task table.
+        """
+        table = self.task.get_table(split)
+        # Get timestamp column (usually 'time' or task-specific)
+        if hasattr(self.task, 'time_col'):
+            time_col = self.task.time_col
+        else:
+            # Try common names
+            time_col = None
+            for col in ['time', 'timestamp', 't']:
+                if col in table.df.columns:
+                    time_col = col
+                    break
+            if time_col is None:
+                raise ValueError(f"Could not find timestamp column in {split} table")
+        
+        seed_times = torch.from_numpy(table.df[time_col].values.astype(np.int64))
+        return seed_times
+    
+    def build_metadata(
+        self, 
+        rt_batch: Dict[str, Tensor],
+        split: str
+    ) -> Dict:
+        """
+        Build Rel-LLM metadata from RT batch (OPTIMIZED VERSION).
+        
+        For RT batches, we skip expensive nested loops since:
+        - Temporal encoder is skipped (time_dict=None)
+        - batch_dict is only used for temporal encoder
+        - n_id_dict is only needed for ID embeddings (optional)
+        
+        Returns dict with:
+        - seed_time: (batch_size,) timestamps for seed nodes
+        - n_id: dict mapping node_type -> global node IDs (minimal, for ID embeddings if needed)
+        - time_dict: empty dict (temporal encoder skipped for RT)
+        - batch_dict: empty dict (not used when temporal encoder skipped)
+        """
+        # Extract seed nodes (needed for batch_size)
+        seed_cell_indices_list, batch_size = self.extract_seed_nodes(rt_batch)
+        
+        # Cheap seed_time: just slice table times
+        all_seed_times = self.extract_seed_time(split)
+        seed_time = all_seed_times[:batch_size] if len(all_seed_times) >= batch_size else all_seed_times
+        
+        # Build minimal n_id_dict: only for nodes that appear in batch (for ID embeddings if enabled)
+        # This is much cheaper than the full nested loop version
+        node_idxs = rt_batch['node_idxs']  # (B, S)
+        table_name_idxs = rt_batch['table_name_idxs']  # (B, S)
+        B, S = node_idxs.shape
+        
+        n_id_dict = {}
+        # Group cells by table - vectorized version
+        all_table_idxs = torch.unique(table_name_idxs.flatten())
+        for table_idx_tensor in all_table_idxs:
+            table_idx = int(table_idx_tensor.item())
+            if table_idx not in self.table_idx_to_node_type:
+                continue
+            node_type = self.table_idx_to_node_type[table_idx]
+            
+            # Vectorized: collect all nodes for this table across all batch items
+            mask = (table_name_idxs.flatten() == table_idx)
+            table_node_idxs = node_idxs.flatten()[mask]
+            if len(table_node_idxs) > 0:
+                unique_nodes = torch.unique(table_node_idxs)
+                n_id_dict[node_type] = unique_nodes
+            else:
+                n_id_dict[node_type] = torch.tensor([], dtype=torch.long, device=node_idxs.device)
+        
+        # For RT batches, we don't need batch_dict or time_dict
+        # Temporal encoder is skipped, and batch_dict is only used for temporal encoding
+        time_dict = {}  # Empty - temporal encoder skips None/empty dict
+        batch_dict = {}  # Empty - not used when temporal encoder skipped
+        
+        return {
+            'seed_time': seed_time,
+            'n_id': n_id_dict,
+            'time_dict': time_dict,
+            'batch_dict': batch_dict,
+            'batch_size': batch_size
+        }
+
+
+def create_rt_loader(
+    task,
+    dataset_name: str,
+    entity_table: str,
+    split: str,
+    batch_size: int = 32,
+    seq_len: int = 1024,
+    max_bfs_width: int = 256,
+    embedding_model: str = "all-MiniLM-L12-v2",
+    d_text: int = 384,
+    num_workers: int = 0,
+    seed: int = 0,
+):
+    """
+    Create RT's DataLoader using RelationalDataset.
+    
+    Returns:
+        loader: DataLoader that yields RT batch format
+        bridge: RTBatchToRelLLMFormat for converting to Rel-LLM format
+    """
+    # Get target column name
+    target_column = task.target_col if hasattr(task, 'target_col') else task.name.split('-')[-1]
+    
+    # RT expects the task table name (e.g., "user-churn"), not the entity table (e.g., "customer")
+    # The task table name is typically the task name itself
+    task_table_name = task.name  # e.g., "user-churn"
+    
+    # Create RT dataset
+    print(f"[DEBUG] Creating RT RelationalDataset for {split} split...")
+    rt_dataset = RelationalDataset(
+        tasks=[(dataset_name, task_table_name, target_column, split, [])],
+        batch_size=batch_size,
+        seq_len=seq_len,
+        rank=0,  # Single GPU
+        world_size=1,
+        max_bfs_width=max_bfs_width,
+        embedding_model=embedding_model,
+        d_text=d_text,
+        seed=seed,
+    )
+    print(f"[DEBUG] RT dataset created, length={len(rt_dataset)}")
+    
+    # Create DataLoader
+    print(f"[DEBUG] Creating DataLoader with num_workers={num_workers}...")
+    loader = DataLoader(
+        rt_dataset,
+        batch_size=None,  # Dataset returns batches directly
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=True,
+        shuffle=(split == "train"),
+    )
+    print(f"[DEBUG] DataLoader created for {split} split")
+    
+    # Create bridge
+    bridge = RTBatchToRelLLMFormat(task, entity_table, dataset_name)
+    
+    return loader, bridge

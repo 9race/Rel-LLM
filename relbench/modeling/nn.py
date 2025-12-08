@@ -71,6 +71,10 @@ class HeteroTemporalEncoder(torch.nn.Module):
     def forward(self, seed_time: Tensor, time_dict: Dict[NodeType, Tensor], batch_dict: Dict[NodeType, Tensor], ) -> Dict[NodeType, Tensor]:
         out_dict: Dict[NodeType, Tensor] = {}
         for node_type, time in time_dict.items():   # time_dict -> timestamp at which a node appears.
+            # Skip node types without timestamps (e.g., RT batches that don't expose node timestamps)
+            if time is None:
+                continue
+            
             rel_time = seed_time[batch_dict[node_type]] - time  # the relative time span between the timestamp of the entity and the querying seed time
             rel_time = rel_time / (60 * 60 * 24)  # Convert seconds to days.
 
