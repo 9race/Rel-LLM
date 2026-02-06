@@ -406,11 +406,50 @@ class Model(torch.nn.Module):
                             break
                     
                     if not found:
-                        # Last resort: use the first table and warn
-                        rt_table_name = list(x_dict.keys())[0]
-                        remapped_x_dict[entity_table] = x_dict[rt_table_name]
-                        if self._encode_call_count == 0:
-                            print(f"[DEBUG] WARNING: Could not find matching table, using first table {rt_table_name} -> {entity_table}", flush=True)
+                        # Try to infer the task table from RT batch metadata (is_task_nodes)
+                        inferred_table_name = None
+                        inferred_count = 0
+                        if 'is_task_nodes' in rt_batch_cpu and 'table_name_idxs' in rt_batch_cpu:
+                            table_name_idxs = rt_batch_cpu['table_name_idxs']  # (B, S)
+                            is_task_nodes = rt_batch_cpu['is_task_nodes']      # (B, S)
+                            # Count task nodes per table idx
+                            unique_tables = torch.unique(table_name_idxs)
+                            best_count = 0
+                            best_table_idx = None
+                            for t_idx in unique_tables.tolist():
+                                mask = (table_name_idxs == t_idx) & is_task_nodes
+                                count = int(mask.sum().item())
+                                if count > best_count:
+                                    best_count = count
+                                    best_table_idx = t_idx
+                            if best_table_idx is not None and best_count > 0:
+                                inferred_table_name = bridge.table_idx_to_node_type.get(int(best_table_idx))
+                                inferred_count = best_count
+                        
+                        if inferred_table_name and inferred_table_name in x_dict:
+                            remapped_x_dict[entity_table] = x_dict[inferred_table_name]
+                            found = True
+                            if self._encode_call_count == 0:
+                                print(
+                                    f"[DEBUG] Mapped {inferred_table_name} -> {entity_table} (inferred from is_task_nodes, count={inferred_count})",
+                                    flush=True,
+                                )
+
+                    if not found:
+                        # No safe mapping found: fail fast with a clear error.
+                        inferred_msg = (
+                            f"inferred_table={inferred_table_name} (task_nodes={inferred_count})"
+                            if 'inferred_table_name' in locals()
+                            else "inferred_table=None"
+                        )
+                        raise KeyError(
+                            "RT batch did not produce embeddings for entity_table="
+                            f"{entity_table}. Available tables: {list(x_dict.keys())}. "
+                            f"rt_task_table_name={bridge.rt_task_table_name}, {inferred_msg}. "
+                            "This usually means the RT preprocessed data / checkpoint is for a different task "
+                            f"(e.g., 'ad-ctr') than the current task ('{bridge.rt_task_table_name}'). "
+                            "Please regenerate RT preprocessing for this task or use a matching task/checkpoint."
+                        )
             
             # Keep other tables as-is (they might be other task tables or DB tables)
             for rt_table_name, emb in x_dict.items():

@@ -361,7 +361,7 @@ if __name__ == '__main__':
                     if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (not higher_is_better and val_metrics[tune_metric] <= best_val_metric):
                         best_val_metric = val_metrics[tune_metric]
                         test_pred = test(loader_dict["test"], demo, split="test")
-                        test_metrics = task.evaluate(test_pred)
+                        test_metrics = task.evaluate(test_pred, task.get_table("test", mask_input_cols=False))
                         if not args.debug:
                             for k, v in test_metrics.items():
                                 run.log({f'test/{k}': v}, step=pretrain_steps)
@@ -459,7 +459,7 @@ if __name__ == '__main__':
                 val_pred = test(loader_dict["val"], split="val")
                 val_metrics = task.evaluate(val_pred, task.get_table("val"))
                 test_pred = test(loader_dict["test"], split="test")
-                test_metrics = task.evaluate(test_pred)
+                test_metrics = task.evaluate(test_pred, task.get_table("test", mask_input_cols=False))
                 if not args.debug:
                     for k, v in val_metrics.items():
                         run.log({f'val/{k}': v}, step=steps)
@@ -474,11 +474,12 @@ if __name__ == '__main__':
     #############################################
     # evaluation
     #############################################
-    model.load_state_dict(state_dict)
+    if state_dict is not None:
+        model.load_state_dict(state_dict)
     val_pred = test(loader_dict["val"], split="val")
     val_metrics = task.evaluate(val_pred, task.get_table("val"))
     test_pred = test(loader_dict["test"], split="test")
-    test_metrics = task.evaluate(test_pred)
+    test_metrics = task.evaluate(test_pred, task.get_table("test", mask_input_cols=False))
     print(f"Best Val metrics: {val_metrics}")  # nuance due to sampling
     print(f"Best test metrics: {test_metrics}")
     for k, v in test_metrics.items():

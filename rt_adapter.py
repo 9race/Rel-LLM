@@ -758,8 +758,8 @@ class RTBatchToRelLLMFormat:
         self.entity_table = entity_table
         self.dataset_name = dataset_name
         
-        # RT uses task table name (e.g., "user-churn") while Rel-LLM uses entity table name (e.g., "customer")
-        # Store the RT task table name that corresponds to the entity_table
+        # RT uses task table name (e.g., "user-churn") while Rel-LLM uses entity table name (e.g., "customer").
+        # Default to task.name, but we may override after loading table_info if entity_table exists there.
         self.rt_task_table_name = task.name  # e.g., "user-churn" for user-churn task
         
         # Load RT's table_info to map node indices and table names
@@ -771,27 +771,59 @@ class RTBatchToRelLLMFormat:
         else:
             self.table_info = {}
         
-        # Build mapping from RT table index → table name (node type)
-        # RT's table_info keys are "table_name:TableType" (e.g., "users:Db", "users:Train")
-        # We extract table names and order by node_idx_offset to get table indices
-        table_entries = []
-        for key, info in self.table_info.items():
-            table_name = key.split(':')[0]  # Extract table name before ':'
-            table_entries.append((table_name, info['node_idx_offset'], key))
-        
-        # Sort by node_idx_offset to get table index order
-        table_entries.sort(key=lambda x: x[1])
-        
-        # Build mapping: table_idx → table_name (node_type)
+        # Build mapping from RT table_name_idx → table name (node type).
+        # RT's table_name_idx comes from text_to_idx in preprocessing (text.json),
+        # not from node_idx_offset ordering.
         self.table_idx_to_node_type = {}
         self.node_type_to_table_idx = {}
-        for table_idx, (table_name, _, _) in enumerate(table_entries):
-            self.table_idx_to_node_type[table_idx] = table_name
-            if table_name not in self.node_type_to_table_idx:
-                self.node_type_to_table_idx[table_name] = table_idx
+
+        # Load text.json to recover text_to_idx mapping used by Rust preprocessor
+        text_json_path = os.path.join(home, "scratch", "pre", dataset_name, "text.json")
+        text_to_idx = {}
+        if os.path.exists(text_json_path):
+            try:
+                with open(text_json_path) as f:
+                    text_list = json.load(f)
+                # Build str -> idx
+                text_to_idx = {s: i for i, s in enumerate(text_list)}
+            except Exception:
+                text_to_idx = {}
+
+        # Table names are in table_info keys (table_name:TableType)
+        table_names = set()
+        for key in self.table_info.keys():
+            table_names.add(key.split(":")[0])
+
+        # Use text_to_idx if available (correct mapping), otherwise fallback
+        if text_to_idx:
+            for table_name in table_names:
+                if table_name in text_to_idx:
+                    table_idx = int(text_to_idx[table_name])
+                    self.table_idx_to_node_type[table_idx] = table_name
+                    if table_name not in self.node_type_to_table_idx:
+                        self.node_type_to_table_idx[table_name] = table_idx
+        else:
+            # Fallback: previous heuristic based on node_idx_offset ordering
+            table_entries = []
+            for key, info in self.table_info.items():
+                table_name = key.split(":")[0]
+                table_entries.append((table_name, info["node_idx_offset"], key))
+            table_entries.sort(key=lambda x: x[1])
+            for table_idx, (table_name, _, _) in enumerate(table_entries):
+                self.table_idx_to_node_type[table_idx] = table_name
+                if table_name not in self.node_type_to_table_idx:
+                    self.node_type_to_table_idx[table_name] = table_idx
         
+        # If the task name doesn't exist in RT's table_info but the entity_table does,
+        # fall back to entity_table as the RT task table name.
+        if (
+            self.rt_task_table_name not in self.node_type_to_table_idx
+            and self.entity_table in self.node_type_to_table_idx
+        ):
+            self.rt_task_table_name = self.entity_table
+
         # Build reverse mapping: RT task table name → Rel-LLM entity table name
-        # For the entity table, use the RT task table name
+        # For the entity table, use the resolved RT task table name
         self.rt_to_relllm_table_map = {self.rt_task_table_name: self.entity_table}
     
     def extract_seed_nodes(self, rt_batch: Dict[str, Tensor]) -> Tuple[List[Tensor], int]:
