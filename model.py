@@ -40,11 +40,36 @@ accept_stypes = [stype.numerical, stype.categorical, stype.text_tokenized, stype
 
 class Model(torch.nn.Module):
 
-    def __init__(self, data: HeteroData, col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]], num_layers: int, channels: int, out_channels: int, aggr: str,
-                 norm: str = "batch_norm", dropout=0.0, shallow_list: List[NodeType] = [],  # List of node types to add shallow embeddings to input
-                 id_awareness: bool = False, model_type: str = "meta-llama/Llama-3.2-1B", max_new_tokens=1, llm_frozen=False, output_mlp=False, output_probs=True, num_demo=4,
-                 dataset=None, task=None, gamma=2.0, alpha=[1.0, 1.0], mask_ratio=0.5, pretrain_random_table=False, pretrain_mask_cell=True,
-                 use_rt_encoder: bool = False, rt_config: Optional[Dict] = None, text_embedder=None):
+    def __init__(
+        self,
+        data: HeteroData,
+        col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]],
+        num_layers: int,
+        channels: int,
+        out_channels: int,
+        aggr: str,
+        norm: str = "batch_norm",
+        dropout=0.0,
+        shallow_list: List[NodeType] = [],  # List of node types to add shallow embeddings to input
+        id_awareness: bool = False,
+        model_type: str = "meta-llama/Llama-3.2-1B",
+        max_new_tokens=1,
+        llm_frozen=False,
+        output_mlp=False,
+        output_probs=True,
+        num_demo=4,
+        dataset=None,
+        task=None,
+        gamma=2.0,
+        alpha=[1.0, 1.0],
+        mask_ratio=0.5,
+        pretrain_random_table=False,
+        pretrain_mask_cell=True,
+        use_rt_encoder: bool = False,
+        rt_config: Optional[Dict] = None,
+        text_embedder=None,
+        trace_shapes: bool = False,
+    ):
         super().__init__()
         self.aggr = aggr  # Store aggregation method for RT cell-to-node aggregation
         self.use_rt_encoder = use_rt_encoder and RT_AVAILABLE
@@ -121,6 +146,7 @@ class Model(torch.nn.Module):
         self.output_probs = output_probs
         self.gamma = gamma
         self.alpha = alpha
+        self.trace_shapes = trace_shapes
 
         # pretrain setup
         self.pretrain_mask_cell = pretrain_mask_cell
@@ -270,7 +296,7 @@ class Model(torch.nn.Module):
             time_dict = metadata['time_dict']
             batch_dict = metadata['batch_dict']
             
-            # Store n_id_dict for seed node mapping in forward()
+            # Store raw n_id_dict (RT table names) for reference
             self._rt_n_id_dict = n_id_dict
             
             # IMPORTANT: Use true_batch_size from RT sampler (number of seed examples)
@@ -296,8 +322,9 @@ class Model(torch.nn.Module):
             node_idxs = rt_batch_cpu['node_idxs']  # (B, S) - global node indices
             table_name_idxs = rt_batch_cpu['table_name_idxs']  # (B, S)
             
-            # Get table index for entity_table
-            entity_table_idx = bridge.node_type_to_table_idx.get(entity_table, None)
+            # Seed nodes come from the RT task table (e.g., "user-visits"), not the entity table
+            task_table_name = bridge.rt_task_table_name
+            task_table_idx = bridge.node_type_to_table_idx.get(task_table_name, None)
             
             seed_node_ids = []
             for b in range(min(batch_size, is_task_nodes.shape[0])):
@@ -305,8 +332,8 @@ class Model(torch.nn.Module):
                 batch_node_idxs = node_idxs[b]  # (S,)
                 batch_table_idxs = table_name_idxs[b]  # (S,)
                 
-                # Find seed cells that belong to entity_table
-                seed_mask = batch_is_task & (batch_table_idxs == entity_table_idx)
+                # Find seed cells that belong to the task table
+                seed_mask = batch_is_task & (batch_table_idxs == task_table_idx)
                 seed_node_ids_batch = batch_node_idxs[seed_mask].unique()
                 seed_node_ids.append(seed_node_ids_batch)
             
@@ -327,8 +354,8 @@ class Model(torch.nn.Module):
                 batch_node_idxs = node_idxs[b]  # (S,)
                 batch_table_idxs = table_name_idxs[b]  # (S,)
                 
-                # Find first seed cell that belongs to entity_table (one per batch item)
-                seed_mask = batch_is_task & (batch_table_idxs == entity_table_idx)
+                # Find first seed cell that belongs to the task table (one per batch item)
+                seed_mask = batch_is_task & (batch_table_idxs == task_table_idx)
                 if seed_mask.any():
                     seed_node_id = batch_node_idxs[seed_mask][0].item()  # Take first seed node
                     self._rt_seed_node_ids_per_batch.append(seed_node_id)
@@ -460,6 +487,17 @@ class Model(torch.nn.Module):
                         remapped_x_dict[rel_llm_name] = emb
             
             x_dict = remapped_x_dict
+
+            # Remap n_id_dict to match x_dict keys (critical for seed node indexing)
+            remapped_n_id_dict = {}
+            if bridge.rt_task_table_name in n_id_dict:
+                remapped_n_id_dict[entity_table] = n_id_dict[bridge.rt_task_table_name]
+            for rt_table_name, n_id in n_id_dict.items():
+                if rt_table_name != bridge.rt_task_table_name:
+                    rel_llm_name = bridge.rt_to_relllm_table_map.get(rt_table_name, rt_table_name)
+                    if rel_llm_name != entity_table:
+                        remapped_n_id_dict[rel_llm_name] = n_id
+            self._rt_n_id_dict = remapped_n_id_dict
 
             if self._encode_call_count == 0:
                 print(f"[DEBUG] After remapping, x_dict keys={list(x_dict.keys())}", flush=True)
@@ -642,51 +680,36 @@ class Model(torch.nn.Module):
             if 'is_targets' not in batch:
                 raise ValueError("RT batch is missing 'is_targets'")
 
-            is_targets = batch['is_targets']          # (B, S)
-            B, S = is_targets.shape
+            is_targets = batch['is_targets']  # (B, S)
+            B, _ = is_targets.shape
 
-            # IMPORTANT: Use true_batch_size to avoid processing padding items
-            # RT pads batches to batch_size, but only first true_batch_size items are real
+            # RT pads batches; only first true_batch_size are real
             true_bs = batch.get("true_batch_size", B)
             if true_bs > B:
-                # Sanity check: true_batch_size shouldn't exceed batch dimension
                 true_bs = B
 
-            label_values: List[float] = []
+            def _get_values(key: str, task_name: str) -> List[float]:
+                if key not in batch:
+                    raise ValueError(f"RT batch missing '{key}' for {task_name} task")
+                vals_out: List[float] = []
+                for b in range(true_bs):
+                    mask = is_targets[b]
+                    if not mask.any():
+                        raise ValueError(f"No target cell found for RT batch item {b}")
+                    vals = batch[key][b][mask].view(-1)
+                    vals_out.append(vals[0].item())
+                return vals_out
 
-            # Only process real batch items (not padding)
-            for b in range(true_bs):
-                mask = is_targets[b]                  # (S,)
-                if not mask.any():
-                    raise ValueError(f"No target cell found for RT batch item {b}")
-
-                if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
-                    if 'boolean_values' not in batch:
-                        raise ValueError("RT batch missing 'boolean_values' for binary task")
-                    vals = batch['boolean_values'][b][mask].view(-1)
-                    # take first target value
-                    v = vals[0].item()
-                    # assume >0.5 is True
-                    label_values.append(bool(v > 0.5))
-
-                elif self.task.task_type == TaskType.REGRESSION:
-                    if 'number_values' not in batch:
-                        raise ValueError("RT batch missing 'number_values' for regression task")
-                    vals = batch['number_values'][b][mask].view(-1)
-                    v = vals[0].item()
-                    label_values.append(float(v))
-
-                else:
-                    raise ValueError(f"Unsupported task type for RT label_tokenize: {self.task.task_type}")
-
-            # Now convert label_values → strings for tokenizer
             if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
-                label_strs = ['Yes' if v else 'No' for v in label_values]
+                raw_vals = _get_values("boolean_values", "binary")
+                label_strs = ["Yes" if v > 0.5 else "No" for v in raw_vals]
             elif self.task.task_type == TaskType.REGRESSION:
-                label_strs = [str(v) for v in label_values]
+                raw_vals = _get_values("number_values", "regression")
+                label_strs = [str(float(v)) for v in raw_vals]
+            else:
+                raise ValueError(f"Unsupported task type for RT label_tokenize: {self.task.task_type}")
 
-            labels = self.tokenizer(label_strs, add_special_tokens=False)
-            return labels
+            return self.tokenizer(label_strs, add_special_tokens=False)
 
         # ---------- Original HeteroData path ----------
         if self.task.task_type == TaskType.BINARY_CLASSIFICATION:
@@ -790,36 +813,51 @@ class Model(torch.nn.Module):
             x_dict = self.gnn(x_dict, batch.edge_index_dict)  # interactions among different tables
 
         # For RT batches, use precise seed node mapping if available
-        if hasattr(self, '_rt_seed_node_ids') and self._rt_seed_node_ids is not None and len(self._rt_seed_node_ids) > 0:
-            # Map seed node IDs to their positions in x_dict[entity_table]
-            # x_dict[entity_table] corresponds to n_id_dict[entity_table] from metadata
-            seed_node_ids = self._rt_seed_node_ids
+        if hasattr(self, '_rt_seed_node_ids_per_batch') and self._rt_seed_node_ids_per_batch is not None and len(self._rt_seed_node_ids_per_batch) > 0:
+            # Prefer per-batch seed IDs to preserve order
+            seed_ids_ordered = [sid for sid in self._rt_seed_node_ids_per_batch if sid is not None]
             if entity_table in x_dict:
-                # Get node IDs from metadata (stored in encode)
                 if hasattr(self, '_rt_n_id_dict') and entity_table in self._rt_n_id_dict:
                     n_id_entity = self._rt_n_id_dict[entity_table]
-                    # Find positions of seed nodes in n_id_entity
+                    seed_positions = []
+                    for seed_id in seed_ids_ordered:
+                        matches = (n_id_entity == seed_id)
+                        if matches.any():
+                            pos = torch.where(matches)[0][0]
+                            seed_positions.append(pos.item())
+                    if len(seed_positions) == batch_size:
+                        seed_positions_tensor = torch.tensor(seed_positions, device=x_dict[entity_table].device)
+                        node_embed = x_dict[entity_table][seed_positions_tensor]
+                    else:
+                        if not hasattr(self, '_encode_call_count') or self._encode_call_count == 0:
+                            print(f"[DEBUG] WARNING: Found {len(seed_positions)} seed positions but batch_size={batch_size}, using first batch_size nodes", flush=True)
+                        node_embed = x_dict[entity_table][:batch_size]
+                else:
+                    node_embed = x_dict[entity_table][:batch_size]
+            else:
+                raise KeyError(f"Entity table '{entity_table}' not found in x_dict. Available keys: {list(x_dict.keys())}")
+        elif hasattr(self, '_rt_seed_node_ids') and self._rt_seed_node_ids is not None and len(self._rt_seed_node_ids) > 0:
+            # Fallback: use unique seed IDs (may lose order)
+            seed_node_ids = self._rt_seed_node_ids
+            if entity_table in x_dict:
+                if hasattr(self, '_rt_n_id_dict') and entity_table in self._rt_n_id_dict:
+                    n_id_entity = self._rt_n_id_dict[entity_table]
                     seed_positions = []
                     for seed_id in seed_node_ids:
                         matches = (n_id_entity == seed_id.item())
                         if matches.any():
                             pos = torch.where(matches)[0][0]
                             seed_positions.append(pos.item())
-                    
                     if len(seed_positions) == batch_size:
-                        # Use precise seed node positions
                         seed_positions_tensor = torch.tensor(seed_positions, device=x_dict[entity_table].device)
                         node_embed = x_dict[entity_table][seed_positions_tensor]
                     else:
-                        # Fallback: use first batch_size nodes
                         if not hasattr(self, '_encode_call_count') or self._encode_call_count == 0:
                             print(f"[DEBUG] WARNING: Found {len(seed_positions)} seed positions but batch_size={batch_size}, using first batch_size nodes", flush=True)
                         node_embed = x_dict[entity_table][:batch_size]
                 else:
-                    # No metadata available, use first batch_size
                     node_embed = x_dict[entity_table][:batch_size]
             else:
-                # Entity table not in x_dict, this shouldn't happen
                 raise KeyError(f"Entity table '{entity_table}' not found in x_dict. Available keys: {list(x_dict.keys())}")
         else:
             # Original path: use first batch_size nodes
@@ -830,12 +868,36 @@ class Model(torch.nn.Module):
 
         # Project graph embeddings to LLM dimension
         node_embed = self.projector(node_embed)
+        if self.trace_shapes and not hasattr(self, "_trace_once"):
+            self._trace_once = True
+            print(
+                "[TRACE] node_embed stats:",
+                node_embed.min().item(),
+                node_embed.max().item(),
+                node_embed.mean().item(),
+                node_embed.std().item(),
+                "shape=",
+                tuple(node_embed.shape),
+                flush=True,
+            )
 
         # 2) Text side: task description, question, labels
         task_desc = description_dict[self.dataset][self.task.name]
         question = " Question: " + question_dict[self.dataset][self.task.name] + " Answer: "
         task_descs = self.tokenizer(task_desc, add_special_tokens=False)
         questions = self.tokenizer(question, add_special_tokens=False)
+        if self.trace_shapes and not hasattr(self, "_trace_prompt_once"):
+            self._trace_prompt_once = True
+            print("[TRACE] task_desc:", task_desc, flush=True)
+            print("[TRACE] question:", question, flush=True)
+            print(
+                "[TRACE] prompt token lengths:",
+                "task_desc=",
+                len(task_descs.input_ids),
+                "question=",
+                len(questions.input_ids),
+                flush=True,
+            )
 
         is_rt_batch = isinstance(batch, dict) and 'node_idxs' in batch
 
@@ -936,11 +998,29 @@ class Model(torch.nn.Module):
                 if neighbor_embed is not None:
                     neighbor_embed = self.projector(neighbor_embed)
                     graph_prompt = torch.cat([graph_prompt, neighbor_embed])
+            if self.trace_shapes and not hasattr(self, "_trace_graph_once"):
+                self._trace_graph_once = True
+                print(
+                    "[TRACE] graph_prompt shape:",
+                    tuple(graph_prompt.shape),
+                    "first_vec=",
+                    graph_prompt[0, :8].detach().cpu().tolist(),
+                    flush=True,
+                )
 
             # BOS + graph prompt + text
             inputs_embeds = torch.cat(
                 [self.bos_embeds, graph_prompt, inputs_embeds], dim=0
             )
+            if self.trace_shapes and not hasattr(self, "_trace_inputs_once"):
+                self._trace_inputs_once = True
+                print(
+                    "[TRACE] inputs_embeds shape:",
+                    tuple(inputs_embeds.shape),
+                    "first_vec=",
+                    inputs_embeds[0, :8].detach().cpu().tolist(),
+                    flush=True,
+                )
 
             batch_inputs_embeds.append(inputs_embeds)
             batch_attention_mask.append([1] * inputs_embeds.shape[0])
@@ -1064,6 +1144,17 @@ class Model(torch.nn.Module):
             if self.output_probs:
                 # Use logits of generated token for Yes/No
                 scores = outputs.scores[0]
+                if not hasattr(self, "_trace_logits"):
+                    self._trace_logits = True
+                    s = scores[..., [self.false_id, self.true_id]]
+                    print(
+                        "[TRACE] logits yes/no stats:",
+                        s[..., 0].mean().item(),
+                        s[..., 1].mean().item(),
+                        s[..., 0].std().item(),
+                        s[..., 1].std().item(),
+                        flush=True,
+                    )
                 pred = scores[..., [self.false_id, self.true_id]]
                 pred = torch.softmax(pred, dim=-1)[..., 1]
                 pred = torch.nan_to_num(pred, nan=0.5)

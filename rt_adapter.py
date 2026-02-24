@@ -737,22 +737,7 @@ def aggregate_cells_to_nodes_from_rt_batch(
 
     return x_dict
 
-
-# ============================================================================
-# RT SAMPLER BRIDGE - New components for using RT's sampler directly
-# ============================================================================
-
-
 class RTBatchToRelLLMFormat:
-    """
-    Bridge that converts RT batch format + metadata → Rel-LLM format.
-    
-    RT's sampler returns batches in RT format, but Rel-LLM needs:
-    - seed_time: timestamps for seed nodes
-    - n_id: global node IDs  
-    - time_dict: timestamps for all nodes
-    - batch_dict: mapping nodes to seed nodes
-    """
     def __init__(self, task, entity_table: str, dataset_name: str):
         self.task = task
         self.entity_table = entity_table
@@ -770,8 +755,7 @@ class RTBatchToRelLLMFormat:
                 self.table_info = json.load(f)
         else:
             self.table_info = {}
-        
-        # Build mapping from RT table_name_idx → table name (node type).
+
         # RT's table_name_idx comes from text_to_idx in preprocessing (text.json),
         # not from node_idx_offset ordering.
         self.table_idx_to_node_type = {}
@@ -822,7 +806,6 @@ class RTBatchToRelLLMFormat:
         ):
             self.rt_task_table_name = self.entity_table
 
-        # Build reverse mapping: RT task table name → Rel-LLM entity table name
         # For the entity table, use the resolved RT task table name
         self.rt_to_relllm_table_map = {self.rt_task_table_name: self.entity_table}
     

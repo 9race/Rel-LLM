@@ -98,6 +98,16 @@ def test(loader, demo_info=None, split: str = "test") -> np.ndarray:
         else:
             test_batch = test_batch.to(device)
         pred = model(test_batch, task.entity_table, demo_info=demo_info, inference=True, split=split)
+        if task.task_type == TaskType.BINARY_CLASSIFICATION and len(pred_list) == 0:
+            # Trace label distribution on first batch only (if labels are available)
+            try:
+                y = get_batch_labels(test_batch, entity_table=task.entity_table, device=pred.device, task=task)
+                pos = (y > 0.5).sum().item()
+                neg = (y <= 0.5).sum().item()
+                print("[TRACE] y stats:", y.min().item(), y.max().item(), y.float().mean().item(), y.numel(), flush=True)
+                print(f"[TRACE] y counts: pos={pos} neg={neg}", flush=True)
+            except Exception as e:
+                print(f"[TRACE] y stats unavailable: {e}", flush=True)
         if task.task_type == TaskType.REGRESSION:
             assert clamp_min is not None and clamp_max is not None
             pred = torch.clamp(pred, clamp_min, clamp_max)
@@ -106,6 +116,8 @@ def test(loader, demo_info=None, split: str = "test") -> np.ndarray:
             pred = torch.sigmoid(pred)  # normalize to between 0 and 1
 
         pred = pred.view(-1) if len(pred.size()) > 1 and pred.size(1) == 1 else pred
+        if len(pred_list) == 0:
+            print("[TRACE] pred stats:", pred.min().item(), pred.max().item(), pred.mean().item(), pred.std().item(), flush=True)
         pred_list.append(pred.detach().cpu())
     return torch.cat(pred_list, dim=0).numpy()
 
@@ -135,6 +147,9 @@ if __name__ == '__main__':
     parser.add_argument("--rt_num_heads", type=int, default=8, help="Number of attention heads in RT")
     parser.add_argument("--rt_d_ff", type=int, default=1024, help="RT feed-forward dimension (pretrained uses 1024)")
     parser.add_argument("--rt_pretrained_path", type=str, default=None, help="Path to RT pretrained checkpoint")
+
+    # Debug / tracing
+    parser.add_argument("--trace_shapes", action="store_true", help="Print tensor shapes/values for LLM prefix tracing")
 
     # LLMs
     # huggingface-cli download --resume-download gpt2 --local-dir gpt2
@@ -259,9 +274,27 @@ if __name__ == '__main__':
             'pretrained_path': args.rt_pretrained_path,
         }
     
-    model = Model(data, col_stats_dict, args.num_layers, channels=args.channels, out_channels=out_channels, aggr=args.aggr, dropout=args.dropout, model_type=args.model_type,
-                  llm_frozen=args.llm_frozen, output_mlp=args.output_mlp, max_new_tokens=args.max_new_tokens, alpha=args.loss_class_weight, num_demo=args.num_demo,
-                  dataset=args.dataset, task=task, use_rt_encoder=args.use_rt_encoder, rt_config=rt_config, text_embedder=text_embedder).to(device)
+    model = Model(
+        data,
+        col_stats_dict,
+        args.num_layers,
+        channels=args.channels,
+        out_channels=out_channels,
+        aggr=args.aggr,
+        dropout=args.dropout,
+        model_type=args.model_type,
+        llm_frozen=args.llm_frozen,
+        output_mlp=args.output_mlp,
+        max_new_tokens=args.max_new_tokens,
+        alpha=args.loss_class_weight,
+        num_demo=args.num_demo,
+        dataset=args.dataset,
+        task=task,
+        use_rt_encoder=args.use_rt_encoder,
+        rt_config=rt_config,
+        text_embedder=text_embedder,
+        trace_shapes=args.trace_shapes,
+    ).to(device)
     
     # Pass RT bridges to model if using RT sampler
     if args.use_rt_encoder and 'rt_bridge_dict' in locals():
